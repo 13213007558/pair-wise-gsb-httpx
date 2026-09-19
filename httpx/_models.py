@@ -15,11 +15,13 @@ from ._decoders import (
     SUPPORTED_DECODERS,
     ByteChunker,
     ContentDecoder,
+    DecoderFactory,
     IdentityDecoder,
     LineDecoder,
     MultiDecoder,
     TextChunker,
     TextDecoder,
+    load_custom_decoder,
 )
 from ._exceptions import (
     CookieConflict,
@@ -527,6 +529,7 @@ class Response:
         extensions: ResponseExtensions | None = None,
         history: list[Response] | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        decoders: typing.Mapping[str, DecoderFactory] | None = None,
     ) -> None:
         self.status_code = status_code
         self.headers = Headers(headers)
@@ -544,6 +547,16 @@ class Response:
         self.is_stream_consumed = False
 
         self.default_encoding = default_encoding
+
+        # Custom content decoders, mapping a lowercased content-encoding
+        # token onto a factory that creates a fresh decoder instance.
+        # Typically populated by the client, so that instance-level
+        # decoder registrations apply to this response.
+        self._custom_decoders = {} if decoders is None else dict(decoders)
+
+        # The decoded response content, populated once the response
+        # has been read. Declared here for type checking purposes.
+        self._content: bytes
 
         if stream is None:
             headers, stream = encode_response(content, text, html, json)
@@ -574,6 +587,28 @@ class Response:
             if key.lower() == "transfer-encoding" and "content-length" in self.headers:
                 continue
             self.headers.setdefault(key, value)
+
+    def _set_custom_decoders(self, decoders: dict[str, DecoderFactory]) -> None:
+        """
+        Attach instance-level custom content decoders to the response.
+
+        Called by the client once the response has been received from the
+        transport, so that any decoders registered on the client apply.
+        """
+        self._custom_decoders = dict(decoders)
+        if hasattr(self, "_content"):
+            # Responses constructed with `content=...` are eagerly decoded
+            # on instantiation, before the client has attached its custom
+            # decoders. If any custom encodings apply, then those layers
+            # were passed through undecoded, so we re-decode the content
+            # with the complete decoder chain.
+            values = self.headers.get_list("content-encoding", split_commas=True)
+            if any(value.strip().lower() in decoders for value in values):
+                if hasattr(self, "_decoder"):
+                    del self._decoder
+                decoder = self._get_content_decoder()
+                with request_context(request=self._request):
+                    self._content = decoder.decode(self._content) + decoder.flush()
 
     @property
     def elapsed(self) -> datetime.timedelta:
@@ -704,12 +739,14 @@ class Response:
         if not hasattr(self, "_decoder"):
             decoders: list[ContentDecoder] = []
             values = self.headers.get_list("content-encoding", split_commas=True)
+            custom_decoders = getattr(self, "_custom_decoders", None) or {}
             for value in values:
                 value = value.strip().lower()
-                try:
-                    decoder_cls = SUPPORTED_DECODERS[value]
-                    decoders.append(decoder_cls())
-                except KeyError:
+                if value in custom_decoders:
+                    decoders.append(load_custom_decoder(value, custom_decoders[value]))
+                elif value in SUPPORTED_DECODERS:
+                    decoders.append(SUPPORTED_DECODERS[value]())
+                else:
                     continue
 
             if len(decoders) == 1:
@@ -863,7 +900,14 @@ class Response:
         return {
             name: value
             for name, value in self.__dict__.items()
-            if name not in ["extensions", "stream", "is_closed", "_decoder"]
+            if name
+            not in [
+                "extensions",
+                "stream",
+                "is_closed",
+                "_decoder",
+                "_custom_decoders",
+            ]
         }
 
     def __setstate__(self, state: dict[str, typing.Any]) -> None:

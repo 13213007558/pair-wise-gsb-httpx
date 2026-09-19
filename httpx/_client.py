@@ -19,7 +19,7 @@ from ._config import (
     Proxy,
     Timeout,
 )
-from ._decoders import SUPPORTED_DECODERS
+from ._decoders import SUPPORTED_DECODERS, DecoderFactory, validate_decoders
 from ._exceptions import (
     InvalidURL,
     RemoteProtocolError,
@@ -200,6 +200,7 @@ class BaseClient:
         base_url: URL | str = "",
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        decoders: typing.Mapping[str, DecoderFactory] | None = None,
     ) -> None:
         event_hooks = {} if event_hooks is None else event_hooks
 
@@ -208,6 +209,12 @@ class BaseClient:
         self._auth = self._build_auth(auth)
         self._params = QueryParams(params)
         self.headers = Headers(headers)
+        self._custom_decoders = {} if decoders is None else validate_decoders(decoders)
+        if self._custom_decoders and "accept-encoding" not in Headers(headers):
+            # Custom content decoders are included in the default
+            # 'Accept-Encoding' header, unless one has been set explicitly.
+            custom_tokens = ", ".join(sorted(self._custom_decoders))
+            self._headers["Accept-Encoding"] = f"{ACCEPT_ENCODING}, {custom_tokens}"
         self._cookies = Cookies(cookies)
         self._timeout = Timeout(timeout)
         self.follow_redirects = follow_redirects
@@ -634,6 +641,10 @@ class Client(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **decoders** - *(optional)* A dictionary mapping custom content-encoding
+    tokens to decoder factories, enabling support for additional `Content-Encoding`
+    types on this client instance. Each factory is called once per response to
+    create an independent decoder instance.
     """
 
     def __init__(
@@ -658,6 +669,7 @@ class Client(BaseClient):
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        decoders: typing.Mapping[str, DecoderFactory] | None = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -671,6 +683,7 @@ class Client(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            decoders=decoders,
         )
 
         if http2:
@@ -1021,6 +1034,7 @@ class Client(BaseClient):
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+        response._set_custom_decoders(self._custom_decoders)
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',
@@ -1348,6 +1362,10 @@ class AsyncClient(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **decoders** - *(optional)* A dictionary mapping custom content-encoding
+    tokens to decoder factories, enabling support for additional `Content-Encoding`
+    types on this client instance. Each factory is called once per response to
+    create an independent decoder instance.
     """
 
     def __init__(
@@ -1372,6 +1390,7 @@ class AsyncClient(BaseClient):
         transport: AsyncBaseTransport | None = None,
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        decoders: typing.Mapping[str, DecoderFactory] | None = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -1385,6 +1404,7 @@ class AsyncClient(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            decoders=decoders,
         )
 
         if http2:
@@ -1736,6 +1756,7 @@ class AsyncClient(BaseClient):
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+        response._set_custom_decoders(self._custom_decoders)
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',

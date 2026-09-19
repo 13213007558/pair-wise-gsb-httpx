@@ -141,6 +141,44 @@ URL('http://httpbin.org/headers')
 
 For a list of all available client parameters, see the [`Client`](../api.md#client) API reference.
 
+## Custom content decoders
+
+HTTPX includes built-in support for the `gzip`, `deflate`, `br` and `zstd` content encodings. If you are working with a service that uses a custom `Content-Encoding`, you can register additional decoders on a client instance, without affecting the global registry or any other clients:
+
+```python
+import httpx
+
+
+class HexDecoder(httpx.ContentDecoder):
+    # A decoder for a custom 'x-hex' content encoding.
+    # Decoders are incremental: `decode()` may buffer partial data
+    # across chunks, and `flush()` returns any remaining bytes once
+    # the response is complete.
+
+    def __init__(self) -> None:
+        self._buffer = b""
+
+    def decode(self, data: bytes) -> bytes:
+        data = self._buffer + data
+        if len(data) % 2:
+            self._buffer, data = data[-1:], data[:-1]
+        else:
+            self._buffer = b""
+        return bytes.fromhex(data.decode("ascii"))
+
+    def flush(self) -> bytes:
+        if self._buffer:
+            raise httpx.DecodingError("Truncated hex content.")
+        return b""
+
+
+client = httpx.Client(decoders={"x-hex": HexDecoder})
+```
+
+Each key is a content-encoding token, mapped onto a factory that creates a fresh decoder instance. The factory is called once per response, so concurrent responses never share decoder state. Custom encodings compose with the built-in ones: for a `Content-Encoding: gzip, x-hex` response, the layers are decoded in reverse order, with any tail bytes produced by `flush()` propagated through the remaining layers.
+
+Registered tokens are included in the default `Accept-Encoding` header, unless `Accept-Encoding` has been set explicitly on the client or the request. Decoder failures are raised as `httpx.DecodingError`, and never silently returned as garbled content.
+
 ---
 
 ## Request instances

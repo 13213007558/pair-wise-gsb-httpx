@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import codecs
 import io
+import re
 import typing
 import zlib
 
@@ -34,11 +35,36 @@ except ImportError:  # pragma: no cover
 
 
 class ContentDecoder:
+    """
+    Interface for incremental content decoders.
+
+    Custom decoders may subclass this, or simply provide the same
+    'decode()'/'flush()' interface. Each response gets its own decoder
+    instance, so implementations may keep per-response state.
+
+    * 'decode(data)' is called with raw byte chunks as they are received,
+      and returns any decoded bytes that are ready. Decoders may buffer
+      partial data internally.
+    * 'flush()' is called once the response is complete, and returns any
+      remaining decoded bytes, including tail bytes that only become
+      available at the end of the stream.
+
+    Implementations should raise 'httpx.DecodingError' on invalid data.
+    Any other exception raised by a custom decoder is also surfaced as
+    'httpx.DecodingError'.
+    """
+
     def decode(self, data: bytes) -> bytes:
         raise NotImplementedError()  # pragma: no cover
 
     def flush(self) -> bytes:
         raise NotImplementedError()  # pragma: no cover
+
+
+# A decoder factory creates a fresh, independent decoder instance.
+# Factories are registered per-client, mapping a content-encoding token
+# such as "x-custom" onto a factory, and are called once per response.
+DecoderFactory = typing.Callable[[], ContentDecoder]
 
 
 class IdentityDecoder(ContentDecoder):
@@ -391,3 +417,92 @@ if brotli is None:
     SUPPORTED_DECODERS.pop("br")  # pragma: no cover
 if zstandard is None:
     SUPPORTED_DECODERS.pop("zstd")  # pragma: no cover
+
+
+class CustomDecoder(ContentDecoder):
+    """
+    Adapter for user-registered decoders.
+
+    Ensures that custom decoders provide the required interface, and
+    normalizes any failures into `DecodingError`, so that a broken
+    decoder can never silently surface as a garbled response.
+    """
+
+    def __init__(self, decoder: typing.Any) -> None:
+        decode = getattr(decoder, "decode", None)
+        flush = getattr(decoder, "flush", None)
+        if not callable(decode) or not callable(flush):
+            raise DecodingError(
+                "Custom content decoders must provide 'decode()' and 'flush()' "
+                "methods."
+            )
+        self._decoder = decoder
+
+    def decode(self, data: bytes) -> bytes:
+        try:
+            decoded = self._decoder.decode(data)
+        except DecodingError:
+            raise
+        except Exception as exc:
+            raise DecodingError(str(exc)) from exc
+        if not isinstance(decoded, bytes):
+            raise DecodingError("Custom content decoder 'decode()' must return bytes.")
+        return decoded
+
+    def flush(self) -> bytes:
+        try:
+            tail = self._decoder.flush()
+        except DecodingError:
+            raise
+        except Exception as exc:
+            raise DecodingError(str(exc)) from exc
+        if not isinstance(tail, bytes):
+            raise DecodingError("Custom content decoder 'flush()' must return bytes.")
+        return tail
+
+
+_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+
+def validate_decoders(
+    decoders: typing.Mapping[str, DecoderFactory],
+) -> dict[str, DecoderFactory]:
+    """
+    Validate a mapping of content-encoding tokens to decoder factories,
+    returning a normalized copy with lowercased tokens.
+    """
+    validated: dict[str, DecoderFactory] = {}
+    for token, factory in decoders.items():
+        if not isinstance(token, str) or not _TOKEN_RE.match(token):
+            raise ValueError(f"Invalid content-encoding token {token!r}.")
+        token = token.lower()
+        if token in SUPPORTED_DECODERS:
+            raise ValueError(
+                f"Cannot register a custom decoder for {token!r},"
+                " which is a built-in content-encoding."
+            )
+        if token in validated:
+            raise ValueError(
+                f"Duplicate decoder registration for content-encoding {token!r}."
+            )
+        if not callable(factory):
+            raise TypeError(
+                f"Decoder factory for content-encoding {token!r} must be callable."
+            )
+        validated[token] = factory
+    return validated
+
+
+def load_custom_decoder(token: str, factory: DecoderFactory) -> ContentDecoder:
+    """
+    Create a fresh decoder instance from a user-registered factory.
+    """
+    try:
+        decoder = factory()
+    except DecodingError:
+        raise
+    except Exception as exc:
+        raise DecodingError(
+            f"Decoder factory for content-encoding {token!r} failed: {exc}"
+        ) from exc
+    return CustomDecoder(decoder)

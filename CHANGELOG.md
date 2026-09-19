@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+* Add instance-level custom content decoder registration via the `decoders` argument on `Client` and `AsyncClient`, mapping content-encoding tokens to decoder factories. Custom decoders compose with built-in encodings, participate in `Accept-Encoding` negotiation unless explicitly configured, and are exported through the public `httpx.ContentDecoder` interface.
+
 ## 0.28.1 (6th December, 2024)
 
 * Fix SSL case where `verify=False` together with client side certificates.
