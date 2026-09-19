@@ -5,6 +5,7 @@ import datetime
 import email.message
 import json as jsonlib
 import re
+import types
 import typing
 import urllib.request
 from collections.abc import Mapping
@@ -15,14 +16,17 @@ from ._decoders import (
     SUPPORTED_DECODERS,
     ByteChunker,
     ContentDecoder,
+    ContentDecoderRegistry,
     IdentityDecoder,
     LineDecoder,
     MultiDecoder,
     TextChunker,
     TextDecoder,
+    validate_content_decoders,
 )
 from ._exceptions import (
     CookieConflict,
+    DecodingError,
     HTTPStatusError,
     RequestNotRead,
     ResponseNotRead,
@@ -527,6 +531,7 @@ class Response:
         extensions: ResponseExtensions | None = None,
         history: list[Response] | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        content_decoders: ContentDecoderRegistry | None = None,
     ) -> None:
         self.status_code = status_code
         self.headers = Headers(headers)
@@ -544,12 +549,16 @@ class Response:
         self.is_stream_consumed = False
 
         self.default_encoding = default_encoding
+        self._content_decoders = dict(SUPPORTED_DECODERS)
+        self._content_decoders.update(
+            validate_content_decoders(content_decoders)
+        )
 
         if stream is None:
             headers, stream = encode_response(content, text, html, json)
             self._prepare(headers)
             self.stream = stream
-            if isinstance(stream, ByteStream):
+            if isinstance(stream, ByteStream) and self._has_content_decoders():
                 # Load the response body, except for streaming content.
                 self.read()
         else:
@@ -568,12 +577,30 @@ class Response:
 
         self._num_bytes_downloaded = 0
 
+    @property
+    def content_decoders(self) -> ContentDecoderRegistry:
+        """
+        Content decoders available to this response.
+        """
+        return types.MappingProxyType(self._content_decoders)
+
+    @content_decoders.setter
+    def content_decoders(self, content_decoders: ContentDecoderRegistry) -> None:
+        self._content_decoders = dict(SUPPORTED_DECODERS)
+        self._content_decoders.update(validate_content_decoders(content_decoders))
+
     def _prepare(self, default_headers: dict[str, str]) -> None:
         for key, value in default_headers.items():
             # Ignore Transfer-Encoding if the Content-Length has been set explicitly.
             if key.lower() == "transfer-encoding" and "content-length" in self.headers:
                 continue
             self.headers.setdefault(key, value)
+
+    def _has_content_decoders(self) -> bool:
+        values = self.headers.get_list("content-encoding", split_commas=True)
+        return all(
+            value.strip().lower() in self._content_decoders for value in values
+        )
 
     @property
     def elapsed(self) -> datetime.timedelta:
@@ -707,10 +734,13 @@ class Response:
             for value in values:
                 value = value.strip().lower()
                 try:
-                    decoder_cls = SUPPORTED_DECODERS[value]
-                    decoders.append(decoder_cls())
+                    decoder_factory = self._content_decoders[value]
                 except KeyError:
-                    continue
+                    raise DecodingError(
+                        f"Unsupported content encoding: {value!r}"
+                    ) from None
+
+                decoders.append(self._make_content_decoder(value, decoder_factory))
 
             if len(decoders) == 1:
                 self._decoder = decoders[0]
@@ -720,6 +750,57 @@ class Response:
                 self._decoder = IdentityDecoder()
 
         return self._decoder
+
+    def _make_content_decoder(
+        self,
+        encoding: str,
+        decoder_factory: typing.Callable[[], ContentDecoder],
+    ) -> ContentDecoder:
+        try:
+            decoder = decoder_factory()
+        except Exception as exc:
+            if isinstance(exc, DecodingError):
+                raise
+            raise DecodingError(
+                f"Failed to create decoder for content encoding {encoding!r}."
+            ) from exc
+
+        if not isinstance(decoder, ContentDecoder):
+            raise DecodingError(
+                f"Decoder for content encoding {encoding!r} must be a "
+                "ContentDecoder instance."
+            )
+        return decoder
+
+    def _decode_content(self, decoder: ContentDecoder, data: bytes) -> bytes:
+        try:
+            decoded = decoder.decode(data)
+        except DecodingError:
+            raise
+        except Exception as exc:
+            raise DecodingError(str(exc)) from exc
+
+        if not isinstance(decoded, bytes):
+            raise DecodingError(
+                f"Content decoder {type(decoder).__name__!r} returned "
+                f"{type(decoded).__name__!r}, not bytes."
+            )
+        return decoded
+
+    def _flush_content_decoder(self, decoder: ContentDecoder) -> bytes:
+        try:
+            decoded = decoder.flush()
+        except DecodingError:
+            raise
+        except Exception as exc:
+            raise DecodingError(str(exc)) from exc
+
+        if not isinstance(decoded, bytes):
+            raise DecodingError(
+                f"Content decoder {type(decoder).__name__!r} returned "
+                f"{type(decoded).__name__!r}, not bytes."
+            )
+        return decoded
 
     @property
     def is_informational(self) -> bool:
@@ -895,10 +976,10 @@ class Response:
             chunker = ByteChunker(chunk_size=chunk_size)
             with request_context(request=self._request):
                 for raw_bytes in self.iter_raw():
-                    decoded = decoder.decode(raw_bytes)
+                    decoded = self._decode_content(decoder, raw_bytes)
                     for chunk in chunker.decode(decoded):
                         yield chunk
-                decoded = decoder.flush()
+                decoded = self._flush_content_decoder(decoder)
                 for chunk in chunker.decode(decoded):
                     yield chunk  # pragma: no cover
                 for chunk in chunker.flush():
@@ -995,10 +1076,10 @@ class Response:
             chunker = ByteChunker(chunk_size=chunk_size)
             with request_context(request=self._request):
                 async for raw_bytes in self.aiter_raw():
-                    decoded = decoder.decode(raw_bytes)
+                    decoded = self._decode_content(decoder, raw_bytes)
                     for chunk in chunker.decode(decoded):
                         yield chunk
-                decoded = decoder.flush()
+                decoded = self._flush_content_decoder(decoder)
                 for chunk in chunker.decode(decoded):
                     yield chunk  # pragma: no cover
                 for chunk in chunker.flush():

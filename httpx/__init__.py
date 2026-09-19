@@ -4,6 +4,7 @@ from ._auth import *
 from ._client import *
 from ._config import *
 from ._content import *
+from ._decoders import ContentDecoder
 from ._exceptions import *
 from ._models import *
 from ._status_codes import *
@@ -42,6 +43,7 @@ __all__ = [
     "Client",
     "CloseError",
     "codes",
+    "ContentDecoder",
     "ConnectError",
     "ConnectTimeout",
     "CookieConflict",

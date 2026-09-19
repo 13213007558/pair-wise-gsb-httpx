@@ -4,6 +4,7 @@ import datetime
 import enum
 import logging
 import time
+import types
 import typing
 import warnings
 from contextlib import asynccontextmanager, contextmanager
@@ -19,7 +20,11 @@ from ._config import (
     Proxy,
     Timeout,
 )
-from ._decoders import SUPPORTED_DECODERS
+from ._decoders import (
+    SUPPORTED_DECODERS,
+    ContentDecoderRegistry,
+    validate_content_decoders,
+)
 from ._exceptions import (
     InvalidURL,
     RemoteProtocolError,
@@ -117,11 +122,6 @@ USE_CLIENT_DEFAULT = UseClientDefault()
 logger = logging.getLogger("httpx")
 
 USER_AGENT = f"python-httpx/{__version__}"
-ACCEPT_ENCODING = ", ".join(
-    [key for key in SUPPORTED_DECODERS.keys() if key != "identity"]
-)
-
-
 class ClientState(enum.Enum):
     # UNOPENED:
     #   The client has been instantiated, but has not been used to send a request,
@@ -200,8 +200,10 @@ class BaseClient:
         base_url: URL | str = "",
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        content_decoders: ContentDecoderRegistry | None = None,
     ) -> None:
         event_hooks = {} if event_hooks is None else event_hooks
+        self._content_decoders = validate_content_decoders(content_decoders)
 
         self._base_url = self._enforce_trailing_slash(URL(base_url))
 
@@ -270,6 +272,13 @@ class BaseClient:
         }
 
     @property
+    def content_decoders(self) -> ContentDecoderRegistry:
+        """
+        Custom content decoders registered on this client.
+        """
+        return types.MappingProxyType(self._content_decoders)
+
+    @property
     def auth(self) -> Auth | None:
         """
         Authentication class used when none is passed at the request-level.
@@ -304,16 +313,32 @@ class BaseClient:
 
     @headers.setter
     def headers(self, headers: HeaderTypes) -> None:
+        incoming_headers = Headers(headers)
+        accept_encoding = (
+            incoming_headers["accept-encoding"]
+            if "accept-encoding" in incoming_headers
+            else self._accept_encoding
+        )
         client_headers = Headers(
             {
-                b"Accept": b"*/*",
-                b"Accept-Encoding": ACCEPT_ENCODING.encode("ascii"),
-                b"Connection": b"keep-alive",
-                b"User-Agent": USER_AGENT.encode("ascii"),
+                "Accept": "*/*",
+                "Accept-Encoding": accept_encoding,
+                "Connection": "keep-alive",
+                "User-Agent": USER_AGENT,
             }
         )
-        client_headers.update(headers)
+        client_headers.update(incoming_headers)
         self._headers = client_headers
+
+    @property
+    def _accept_encoding(self) -> str:
+        encodings = [key for key in SUPPORTED_DECODERS if key != "identity"]
+        encodings.extend(
+            key
+            for key in self._content_decoders
+            if key != "identity" and key not in SUPPORTED_DECODERS
+        )
+        return ", ".join(encodings)
 
     @property
     def cookies(self) -> Cookies:
@@ -634,6 +659,8 @@ class Client(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **content_decoders** - *(optional)* A mapping of custom `Content-Encoding`
+    tokens to zero-argument decoder factories.
     """
 
     def __init__(
@@ -658,6 +685,7 @@ class Client(BaseClient):
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        content_decoders: ContentDecoderRegistry | None = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -671,6 +699,7 @@ class Client(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            content_decoders=content_decoders,
         )
 
         if http2:
@@ -1021,6 +1050,7 @@ class Client(BaseClient):
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+        response.content_decoders = self._content_decoders
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',
@@ -1348,6 +1378,8 @@ class AsyncClient(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **content_decoders** - *(optional)* A mapping of custom `Content-Encoding`
+    tokens to zero-argument decoder factories.
     """
 
     def __init__(
@@ -1372,6 +1404,7 @@ class AsyncClient(BaseClient):
         transport: AsyncBaseTransport | None = None,
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        content_decoders: ContentDecoderRegistry | None = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -1385,6 +1418,7 @@ class AsyncClient(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            content_decoders=content_decoders,
         )
 
         if http2:
@@ -1736,6 +1770,7 @@ class AsyncClient(BaseClient):
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+        response.content_decoders = self._content_decoders
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',

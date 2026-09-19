@@ -35,6 +35,7 @@ nav:
         - Event Hooks: 'advanced/event-hooks.md'
         - Transports: 'advanced/transports.md'
         - Text Encodings: 'advanced/text-encodings.md'
+        - Content Encodings: 'advanced/content-encodings.md'
         - Extensions: 'advanced/extensions.md'
     - Guides:
         - Async Support: 'async.md'

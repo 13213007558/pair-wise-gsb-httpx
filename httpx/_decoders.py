@@ -6,10 +6,13 @@ See: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Encoding
 
 from __future__ import annotations
 
+import abc
 import codecs
 import io
+import re
 import typing
 import zlib
+from collections.abc import Mapping as MappingType
 
 from ._exceptions import DecodingError
 
@@ -33,12 +36,19 @@ except ImportError:  # pragma: no cover
     zstandard = None  # type: ignore
 
 
-class ContentDecoder:
+class ContentDecoder(abc.ABC):
+    @abc.abstractmethod
     def decode(self, data: bytes) -> bytes:
-        raise NotImplementedError()  # pragma: no cover
+        """Decode a chunk of response bytes."""
 
+    @abc.abstractmethod
     def flush(self) -> bytes:
-        raise NotImplementedError()  # pragma: no cover
+        """Decode any buffered response bytes at the end of the stream."""
+
+
+ContentDecoderFactory = typing.Callable[[], ContentDecoder]
+ContentDecoderRegistry = typing.Mapping[str, ContentDecoderFactory]
+_CONTENT_ENCODING_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9a-z]+$")
 
 
 class IdentityDecoder(ContentDecoder):
@@ -215,14 +225,44 @@ class MultiDecoder(ContentDecoder):
 
     def decode(self, data: bytes) -> bytes:
         for child in self.children:
-            data = child.decode(data)
+            data = self._decode(child, data)
         return data
 
     def flush(self) -> bytes:
         data = b""
         for child in self.children:
-            data = child.decode(data) + child.flush()
+            data = self._decode(child, data) + self._flush(child)
         return data
+
+    def _decode(self, decoder: ContentDecoder, data: bytes) -> bytes:
+        try:
+            decoded = decoder.decode(data)
+        except DecodingError:
+            raise
+        except Exception as exc:
+            raise DecodingError(str(exc)) from exc
+
+        if not isinstance(decoded, bytes):
+            raise DecodingError(
+                f"Content decoder {type(decoder).__name__!r} returned "
+                f"{type(decoded).__name__!r}, not bytes."
+            )
+        return decoded
+
+    def _flush(self, decoder: ContentDecoder) -> bytes:
+        try:
+            decoded = decoder.flush()
+        except DecodingError:
+            raise
+        except Exception as exc:
+            raise DecodingError(str(exc)) from exc
+
+        if not isinstance(decoded, bytes):
+            raise DecodingError(
+                f"Content decoder {type(decoder).__name__!r} returned "
+                f"{type(decoded).__name__!r}, not bytes."
+            )
+        return decoded
 
 
 class ByteChunker:
@@ -385,6 +425,42 @@ SUPPORTED_DECODERS = {
     "br": BrotliDecoder,
     "zstd": ZStandardDecoder,
 }
+
+
+def validate_content_decoders(
+    content_decoders: ContentDecoderRegistry | None,
+) -> dict[str, ContentDecoderFactory]:
+    """
+    Validate and copy a client-specific content decoder registry.
+    """
+    if content_decoders is None:
+        return {}
+
+    if not isinstance(content_decoders, MappingType):
+        raise TypeError(
+            "content_decoders must be a mapping of encoding names to factories."
+        )
+
+    decoders: dict[str, ContentDecoderFactory] = {}
+    for encoding, decoder_factory in content_decoders.items():
+        if not isinstance(encoding, str):
+            raise TypeError("Content encoding names must be strings.")
+
+        normalized_encoding = encoding.strip().lower()
+        if not _CONTENT_ENCODING_TOKEN.fullmatch(normalized_encoding):
+            raise ValueError(f"Invalid content encoding name: {encoding!r}")
+
+        if normalized_encoding in decoders:
+            raise ValueError(f"Duplicate content encoding name: {encoding!r}")
+
+        if not callable(decoder_factory):
+            raise TypeError(
+                f"Decoder for content encoding {encoding!r} must be a callable factory."
+            )
+
+        decoders[normalized_encoding] = decoder_factory
+
+    return decoders
 
 
 if brotli is None:
