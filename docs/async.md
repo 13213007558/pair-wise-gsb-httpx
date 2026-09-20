@@ -115,6 +115,41 @@ async def upload_bytes():
 await client.post(url, content=upload_bytes())
 ```
 
+### Streaming multipart file uploads
+
+Async byte sources, such as async object-storage readers, can be uploaded
+as multipart file parts using `httpx.AsyncFileUpload`. The source is read
+incrementally as the request is sent, rather than being loaded into memory
+upfront:
+
+```python
+files = {
+    "file": httpx.AsyncFileUpload(
+        reader,  # An async iterable of bytes, or an object supporting 'aread()'.
+        filename="data.bin",
+        content_type="application/octet-stream",
+        content_length=size,  # Optional. Used for an accurate 'Content-Length'.
+    )
+}
+
+async with httpx.AsyncClient() as client:
+    response = await client.post(url, files=files)
+```
+
+If `content_length` is not provided then the request is sent using chunked
+transfer encoding. If the number of bytes actually produced by the source
+does not match a declared `content_length`, the request fails with
+`httpx.StreamError`, rather than sending a malformed request body.
+
+If the source provides an `aclose()` method then it is always called once
+the upload completes, fails, or is cancelled. Async sources are read-once,
+and cannot be replayed, so requests including them cannot be redirected or
+retried automatically.
+
+Async file parts can be freely mixed with regular form fields, bytes, and
+file objects. They require an `AsyncClient`; using them with a sync `Client`
+raises an error before the request is sent.
+
 ### Explicit transport instances
 
 When instantiating a transport instance directly, you need to use `httpx.AsyncHTTPTransport`.

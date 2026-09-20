@@ -221,6 +221,10 @@ If you need to include non-file data fields in the multipart form, use the `data
 }
 ```
 
+Async byte sources, such as async object-storage readers, can also be
+uploaded as multipart file parts, using `httpx.AsyncFileUpload` together
+with an `AsyncClient`. See the [async documentation](async.md#streaming-multipart-file-uploads) for details.
+
 ## Sending JSON Encoded Data
 
 Form encoded data is okay if all you need is a simple key-value data structure.

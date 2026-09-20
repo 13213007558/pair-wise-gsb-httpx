@@ -4,6 +4,7 @@ import io
 import tempfile
 import typing
 
+import anyio
 import pytest
 
 import httpx
@@ -467,3 +468,400 @@ class TestHeaderParamHTML5Formatting:
         files = {"upload": (filename, b"<file content>")}
         request = httpx.Request("GET", "https://www.example.com", files=files)
         assert expected in request.read()
+
+
+class ControlledAsyncReader:
+    """
+    A controlled async file-like reader, used to exercise async file uploads.
+
+    Tracks read calls and closure, and always yields to the event loop
+    when reading, so that tests can prove reads do not block the loop.
+    """
+
+    def __init__(
+        self,
+        chunks: typing.List[bytes],
+        *,
+        gate: "anyio.Event | None" = None,
+        fail_on_read: "int | None" = None,
+        delay: float = 0.0,
+    ) -> None:
+        self._chunks = list(chunks)
+        self._gate = gate
+        self._fail_on_read = fail_on_read
+        self._delay = delay
+        self.reads = 0
+        self.closes = 0
+
+    @property
+    def closed(self) -> bool:
+        return self.closes > 0
+
+    async def aread(self, n: int = -1) -> bytes:
+        self.reads += 1
+        if self._delay:
+            await anyio.sleep(self._delay)
+        else:
+            await anyio.sleep(0)
+        if self._gate is not None:
+            await self._gate.wait()
+        if self._fail_on_read is not None and self.reads == self._fail_on_read:
+            raise OSError("Simulated read failure.")
+        if self._chunks:
+            return self._chunks.pop(0)
+        return b""
+
+    async def aclose(self) -> None:
+        self.closes += 1
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    data = {"text": "abc"}
+    files: typing.List[typing.Tuple[str, typing.Any]] = [
+        ("file", b"<bytes content>"),
+        ("tuple-file", ("name.txt", io.BytesIO(b"<tuple content>"), "text/plain")),
+        (
+            "async-file",
+            httpx.AsyncFileUpload(
+                reader,
+                filename="async.bin",
+                content_type="application/octet-stream",
+                headers={"X-Custom": "example"},
+                content_length=20,
+            ),
+        ),
+    ]
+
+    transport = httpx.MockTransport(echo_request_content)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("http://127.0.0.1:8000/", data=data, files=files)
+    boundary = response.request.headers["Content-Type"].split("boundary=")[-1]
+    boundary_bytes = boundary.encode("ascii")
+
+    assert response.status_code == 200
+    assert response.content == b"".join(
+        [
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="text"\r\n',
+            b"\r\n",
+            b"abc\r\n",
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<bytes content>\r\n",
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="tuple-file"; '
+            b'filename="name.txt"\r\n',
+            b"Content-Type: text/plain\r\n",
+            b"\r\n",
+            b"<tuple content>\r\n",
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="async-file"; '
+            b'filename="async.bin"\r\n',
+            b"X-Custom: example\r\n",
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<async file content>\r\n",
+            b"--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+    # All part lengths were known, so an accurate Content-Length is used.
+    assert response.request.headers["Content-Length"] == str(len(response.content))
+    assert "Transfer-Encoding" not in response.request.headers
+    # The source is closed once the upload completes.
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_repeated_filenames():
+    readers = [
+        ControlledAsyncReader([b"<content 1>"]),
+        ControlledAsyncReader([b"<content 2>"]),
+    ]
+    files = [
+        ("file", httpx.AsyncFileUpload(readers[0], filename="same.txt")),
+        ("file", httpx.AsyncFileUpload(readers[1], filename="same.txt")),
+    ]
+
+    transport = httpx.MockTransport(echo_request_content)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("http://127.0.0.1:8000/", files=files)
+
+    assert response.status_code == 200
+    assert response.content.count(b'filename="same.txt"') == 2
+    assert response.content.index(b"<content 1>") < response.content.index(
+        b"<content 2>"
+    )
+    assert all(reader.closed for reader in readers)
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_from_async_iterator():
+    finalized = False
+
+    async def stream() -> typing.AsyncIterator[bytes]:
+        nonlocal finalized
+        try:
+            yield b"hello "
+            yield b"world"
+        finally:
+            finalized = True
+
+    files = {"file": httpx.AsyncFileUpload(stream(), filename="data.txt")}
+
+    transport = httpx.MockTransport(echo_request_content)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("http://127.0.0.1:8000/", files=files)
+
+    assert response.status_code == 200
+    assert b"\r\nhello world\r\n" in response.content
+    # The async generator is closed once the upload completes.
+    assert finalized
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_known_content_length():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {
+        "file": httpx.AsyncFileUpload(reader, filename="data.txt", content_length=20)
+    }
+    request = httpx.Request("POST", "http://127.0.0.1:8000/", files=files)
+
+    assert "Transfer-Encoding" not in request.headers
+    body = await request.aread()
+    assert request.headers["Content-Length"] == str(len(body))
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_unknown_content_length():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {"file": httpx.AsyncFileUpload(reader, filename="data.txt")}
+    request = httpx.Request("POST", "http://127.0.0.1:8000/", files=files)
+
+    # Unknown length streams use chunked transfer encoding.
+    assert request.headers["Transfer-Encoding"] == "chunked"
+    assert "Content-Length" not in request.headers
+    body = await request.aread()
+    assert b"<async file content>" in body
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_is_not_buffered():
+    # The source is read lazily, as the encoded output is consumed,
+    # rather than being read into memory upfront.
+    reader = ControlledAsyncReader([b"chunk-1", b"chunk-2", b"chunk-3"])
+    files = {"file": httpx.AsyncFileUpload(reader, filename="data.txt")}
+    request = httpx.Request("POST", "http://127.0.0.1:8000/", files=files)
+
+    stream = typing.cast(httpx.AsyncByteStream, request.stream)
+    assert reader.reads == 0
+
+    chunks = []
+    async for chunk in stream:
+        chunks.append(chunk)
+        if chunk == b"chunk-1":
+            # Only a single read has occurred at the point the first
+            # file chunk is emitted.
+            assert reader.reads == 1
+
+    assert b"".join(chunks).count(b"chunk-") == 3
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_does_not_block_event_loop():
+    reader = ControlledAsyncReader([b"x" * 1024] * 10, delay=0.01)
+    files = {"file": httpx.AsyncFileUpload(reader, filename="data.txt")}
+    ticks = 0
+    uploading = True
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while uploading:
+            ticks += 1
+            await anyio.sleep(0)
+
+    async def upload() -> None:
+        nonlocal uploading
+        transport = httpx.MockTransport(echo_request_content)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await client.post("http://127.0.0.1:8000/", files=files)
+        uploading = False
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(ticker)
+        await upload()
+
+    # The ticker task progressed while the upload was in flight,
+    # demonstrating that reads did not block the event loop.
+    assert ticks > 0
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_content_length_too_small():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {
+        "file": httpx.AsyncFileUpload(reader, filename="data.txt", content_length=10)
+    }
+
+    transport = httpx.MockTransport(echo_request_content)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(httpx.StreamError, match="content_length"):
+            await client.post("http://127.0.0.1:8000/", files=files)
+
+    # The stream is closed on failure.
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_content_length_too_large():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {
+        "file": httpx.AsyncFileUpload(reader, filename="data.txt", content_length=100)
+    }
+
+    transport = httpx.MockTransport(echo_request_content)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(httpx.StreamError, match="content_length"):
+            await client.post("http://127.0.0.1:8000/", files=files)
+
+    # The stream is closed on failure.
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_read_failure_closes_stream():
+    reader = ControlledAsyncReader([b"chunk-1", b"chunk-2"], fail_on_read=2)
+    files = {"file": httpx.AsyncFileUpload(reader, filename="data.txt")}
+
+    transport = httpx.MockTransport(echo_request_content)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(OSError, match="Simulated read failure"):
+            await client.post("http://127.0.0.1:8000/", files=files)
+
+    # The stream is closed when the source fails.
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_cancellation_closes_stream():
+    gate = anyio.Event()
+    reader = ControlledAsyncReader([b"chunk-1", b"chunk-2"], gate=gate)
+    files = {"file": httpx.AsyncFileUpload(reader, filename="data.txt")}
+
+    async def upload() -> None:
+        transport = httpx.MockTransport(echo_request_content)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await client.post("http://127.0.0.1:8000/", files=files)
+
+    # The reader blocks on the gate, so the upload is cancelled
+    # once the deadline expires.
+    with anyio.move_on_after(0.2):
+        await upload()
+
+    # The stream is closed when the upload is cancelled.
+    assert reader.closed
+    assert reader.reads > 0
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_transport_failure_closes_stream():
+    reader = ControlledAsyncReader([b"chunk-1", b"chunk-2"])
+
+    class FailingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            # Start consuming the request content, then fail.
+            aiterator = request.stream.__aiter__()
+            await aiterator.__anext__()
+            raise httpx.TransportError("Simulated transport failure.")
+
+    files = {"file": httpx.AsyncFileUpload(reader, filename="data.txt")}
+    async with httpx.AsyncClient(transport=FailingTransport()) as client:
+        with pytest.raises(httpx.TransportError, match="Simulated"):
+            await client.post("http://127.0.0.1:8000/", files=files)
+
+    # The stream is closed when the transport fails.
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_cannot_be_replayed():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    upload = httpx.AsyncFileUpload(reader, filename="data.txt", content_length=20)
+
+    transport = httpx.MockTransport(echo_request_content)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("http://127.0.0.1:8000/", files={"file": upload})
+        assert response.status_code == 200
+
+        # Read-once async sources cannot be automatically replayed.
+        with pytest.raises(httpx.StreamConsumed):
+            await client.post("http://127.0.0.1:8000/", files={"file": upload})
+
+
+@pytest.mark.anyio
+async def test_multipart_stream_aclose_closes_async_parts():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {"file": httpx.AsyncFileUpload(reader, filename="data.txt")}
+    request = httpx.Request("POST", "http://127.0.0.1:8000/", files=files)
+
+    stream = typing.cast(httpx.AsyncByteStream, request.stream)
+    await stream.aclose()
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_close_is_idempotent():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    upload = httpx.AsyncFileUpload(reader, filename="data.txt", content_length=20)
+
+    transport = httpx.MockTransport(echo_request_content)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("http://127.0.0.1:8000/", files={"file": upload})
+
+    assert response.status_code == 200
+    stream = typing.cast(httpx.AsyncByteStream, response.request.stream)
+    await stream.aclose()
+    # The underlying source is only ever closed once.
+    assert reader.closes == 1
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_upload_content_type_guessing_and_escaping():
+    reader = ControlledAsyncReader([b"x"])
+    files = {
+        "file": httpx.AsyncFileUpload(
+            reader, filename='hello "world".json', content_length=1
+        )
+    }
+    request = httpx.Request("POST", "http://127.0.0.1:8000/", files=files)
+    body = await request.aread()
+
+    # Filenames use the same HTML5 form escaping as existing file parts,
+    # and the content type is guessed from the filename by default.
+    assert b'filename="hello %22world%22.json"' in body
+    assert b"Content-Type: application/json" in body
+
+
+def test_multipart_async_file_upload_with_sync_client():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {"file": httpx.AsyncFileUpload(reader, filename="data.txt")}
+
+    transport = httpx.MockTransport(echo_request_content)
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(RuntimeError, match="async file parts"):
+            client.post("http://127.0.0.1:8000/", files=files)
+
+
+def test_async_file_upload_requires_async_stream():
+    with pytest.raises(TypeError, match="async byte stream"):
+        httpx.AsyncFileUpload(b"<not an async stream>")  # type: ignore[arg-type]
+
+
+def test_async_file_upload_requires_valid_content_length():
+    reader = ControlledAsyncReader([])
+    with pytest.raises(ValueError, match="content_length"):
+        httpx.AsyncFileUpload(reader, content_length=-1)

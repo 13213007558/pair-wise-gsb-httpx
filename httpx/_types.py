@@ -16,6 +16,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Protocol,
     Sequence,
     Tuple,
     Union,
@@ -25,6 +26,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from ._auth import Auth  # noqa: F401
     from ._config import Proxy, Timeout  # noqa: F401
     from ._models import Cookies, Headers, Request  # noqa: F401
+    from ._multipart import AsyncFileUpload  # noqa: F401
     from ._urls import URL, QueryParams  # noqa: F401
 
 
@@ -75,6 +77,8 @@ FileContent = Union[IO[bytes], bytes, str]
 FileTypes = Union[
     # file (or bytes)
     FileContent,
+    # async file upload
+    "AsyncFileUpload",
     # (filename, file (or bytes))
     Tuple[Optional[str], FileContent],
     # (filename, file (or bytes), content_type)
@@ -112,3 +116,12 @@ class AsyncByteStream:
 
     async def aclose(self) -> None:
         pass
+
+
+class AsyncByteReader(Protocol):
+    """
+    An async file-like object, supporting async 'aread()'.
+    """
+
+    async def aread(self, size: int, /) -> bytes:  # pragma: no cover
+        ...

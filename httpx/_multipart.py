@@ -7,7 +7,9 @@ import re
 import typing
 from pathlib import Path
 
+from ._exceptions import StreamConsumed, StreamError
 from ._types import (
+    AsyncByteReader,
     AsyncByteStream,
     FileContent,
     FileTypes,
@@ -112,6 +114,118 @@ class DataField:
         yield self.render_data()
 
 
+class AsyncFileUpload:
+    """
+    An async file part, for inclusion within a multipart form upload.
+
+    This allows async byte sources, such as async object-storage readers,
+    to be uploaded as multipart file parts, without reading the entire
+    source into memory upfront.
+
+    Usage:
+
+        files = {
+            "file": httpx.AsyncFileUpload(
+                reader,
+                filename="data.bin",
+                content_type="application/octet-stream",
+                content_length=size,  # Optional, if known upfront.
+            )
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, files=files)
+
+    The stream may be any async iterable of bytes, or an async
+    file-like object supporting 'aread()'. If the stream provides an
+    'aclose()' method then it is always called once the part has been
+    fully read, or if reading fails or is cancelled partway through.
+    Streams are read-once, and cannot be replayed.
+    """
+
+    CHUNK_SIZE = 64 * 1024
+
+    def __init__(
+        self,
+        stream: typing.AsyncIterable[bytes] | AsyncByteReader,
+        *,
+        filename: str | None = None,
+        content_type: str | None = None,
+        headers: typing.Mapping[str, str] | None = None,
+        content_length: int | None = None,
+    ) -> None:
+        if not hasattr(stream, "__aiter__") and not hasattr(stream, "aread"):
+            raise TypeError(
+                "AsyncFileUpload requires an async byte stream, supporting "
+                f"either 'aread()' or async iteration. Got {type(stream)!r}."
+            )
+        if content_length is not None and content_length < 0:
+            raise ValueError(
+                "AsyncFileUpload 'content_length' must be greater than or "
+                f"equal to zero. Got {content_length}."
+            )
+        self.stream = stream
+        self.filename = filename
+        self.content_type = content_type
+        self.headers = {} if headers is None else dict(headers)
+        self.content_length = content_length
+        self._is_consumed = False
+        self._is_closed = False
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        if self._is_consumed:
+            # Async streams are read-once, and cannot be replayed.
+            raise StreamConsumed()
+        self._is_consumed = True
+
+        bytes_read = 0
+        try:
+            if hasattr(self.stream, "aread"):
+                # Async file-like interfaces should use 'aread' directly.
+                chunk = await self.stream.aread(self.CHUNK_SIZE)
+                while chunk:
+                    bytes_read += len(chunk)
+                    self._check_length(bytes_read, complete=False)
+                    yield chunk
+                    chunk = await self.stream.aread(self.CHUNK_SIZE)
+            else:
+                # Otherwise use async iteration.
+                async for chunk in self.stream:
+                    bytes_read += len(chunk)
+                    self._check_length(bytes_read, complete=False)
+                    yield chunk
+        finally:
+            # Ensure the source is closed on completion, failure,
+            # or cancellation.
+            await self.aclose()
+
+        self._check_length(bytes_read, complete=True)
+
+    def _check_length(self, bytes_read: int, complete: bool) -> None:
+        if self.content_length is None:
+            return
+        if bytes_read > self.content_length or (
+            complete and bytes_read != self.content_length
+        ):
+            raise StreamError(
+                "Async file upload declared a 'content_length' of "
+                f"{self.content_length} bytes, but the stream produced "
+                f"{bytes_read} bytes."
+            )
+
+    async def aclose(self) -> None:
+        """
+        Close the underlying stream, if it provides an 'aclose()' method.
+
+        This is idempotent, and is a no-op for streams that do not
+        require closing.
+        """
+        if not self._is_closed:
+            self._is_closed = True
+            aclose = getattr(self.stream, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+
 class FileField:
     """
     A single file field item, within a multipart form field.
@@ -122,7 +236,7 @@ class FileField:
     def __init__(self, name: str, value: FileTypes) -> None:
         self.name = name
 
-        fileobj: FileContent
+        fileobj: FileContent | AsyncFileUpload
 
         headers: dict[str, str] = {}
         content_type: str | None = None
@@ -131,7 +245,12 @@ class FileField:
         # It would be good to think of better APIs for this that we could
         # include in httpx 2.0 since variable length tuples(especially of 4 elements)
         # are quite unwieldly
-        if isinstance(value, tuple):
+        if isinstance(value, AsyncFileUpload):
+            filename = value.filename
+            fileobj = value
+            content_type = value.content_type
+            headers = dict(value.headers)
+        elif isinstance(value, tuple):
             if len(value) == 2:
                 # neither the 3rd parameter (content_type) nor the 4th (headers)
                 # was included
@@ -168,8 +287,18 @@ class FileField:
         self.file = fileobj
         self.headers = headers
 
+    @property
+    def is_async(self) -> bool:
+        return isinstance(self.file, AsyncFileUpload)
+
     def get_length(self) -> int | None:
         headers = self.render_headers()
+
+        if isinstance(self.file, AsyncFileUpload):
+            if self.file.content_length is None:
+                # The length of the async stream is not known upfront.
+                return None
+            return len(headers) + self.file.content_length
 
         if isinstance(self.file, (str, bytes)):
             return len(headers) + len(to_bytes(self.file))
@@ -205,6 +334,11 @@ class FileField:
             yield to_bytes(self.file)
             return
 
+        if isinstance(self.file, AsyncFileUpload):
+            raise RuntimeError(
+                "Cannot render an async file part using the sync multipart API."
+            )
+
         if hasattr(self.file, "seek"):
             try:
                 self.file.seek(0)
@@ -219,6 +353,20 @@ class FileField:
     def render(self) -> typing.Iterator[bytes]:
         yield self.render_headers()
         yield from self.render_data()
+
+    async def arender_data(self) -> typing.AsyncIterator[bytes]:
+        if isinstance(self.file, AsyncFileUpload):
+            async for chunk in self.file:
+                yield chunk
+            return
+
+        for chunk in self.render_data():
+            yield chunk
+
+    async def arender(self) -> typing.AsyncIterator[bytes]:
+        yield self.render_headers()
+        async for chunk in self.arender_data():
+            yield chunk
 
 
 class MultipartStream(SyncByteStream, AsyncByteStream):
@@ -240,6 +388,13 @@ class MultipartStream(SyncByteStream, AsyncByteStream):
             "ascii"
         )
         self.fields = list(self._iter_fields(data, files))
+        self._iterator: typing.AsyncGenerator[bytes, None] | None = None
+
+    @property
+    def has_async_parts(self) -> bool:
+        return any(
+            isinstance(field, FileField) and field.is_async for field in self.fields
+        )
 
     def _iter_fields(
         self, data: RequestData, files: RequestFiles
@@ -292,9 +447,36 @@ class MultipartStream(SyncByteStream, AsyncByteStream):
         return {"Content-Length": str(content_length), "Content-Type": content_type}
 
     def __iter__(self) -> typing.Iterator[bytes]:
+        if self.has_async_parts:
+            raise RuntimeError(
+                "Cannot send a multipart request including async file parts "
+                "using a sync Client. Use 'httpx.AsyncClient' instead."
+            )
         for chunk in self.iter_chunks():
             yield chunk
 
-    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        for chunk in self.iter_chunks():
-            yield chunk
+    def __aiter__(self) -> typing.AsyncGenerator[bytes, None]:
+        self._iterator = self._aiter_chunks()
+        return self._iterator
+
+    async def _aiter_chunks(self) -> typing.AsyncGenerator[bytes, None]:
+        for field in self.fields:
+            yield b"--%s\r\n" % self.boundary
+            if isinstance(field, FileField):
+                async for chunk in field.arender():
+                    yield chunk
+            else:
+                for chunk in field.render():
+                    yield chunk
+            yield b"\r\n"
+        yield b"--%s--\r\n" % self.boundary
+
+    async def aclose(self) -> None:
+        if self._iterator is not None:
+            # Ensure any in-progress iteration is closed off, so that
+            # async file parts are not left suspended mid-read.
+            await self._iterator.aclose()
+            self._iterator = None
+        for field in self.fields:
+            if isinstance(field, FileField) and isinstance(field.file, AsyncFileUpload):
+                await field.file.aclose()
