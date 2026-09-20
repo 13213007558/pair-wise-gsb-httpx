@@ -27,6 +27,7 @@ from ._exceptions import (
     request_context,
 )
 from ._models import Cookies, Headers, Request, Response
+from ._multipart import MultipartStream
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
 from ._transports.default import AsyncHTTPTransport, HTTPTransport
@@ -1008,6 +1009,12 @@ class Client(BaseClient):
         if not isinstance(request.stream, SyncByteStream):
             raise RuntimeError(
                 "Attempted to send an async request with a sync Client instance."
+            )
+        if isinstance(request.stream, MultipartStream) and request.stream.is_async:
+            raise RuntimeError(
+                "Attempted to send an async multipart request with a sync"
+                " Client instance. Use 'httpx.AsyncClient' to send requests"
+                " including 'httpx.AsyncFile' parts."
             )
 
         with request_context(request=request):

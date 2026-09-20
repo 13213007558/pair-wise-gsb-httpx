@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+* Add `httpx.AsyncFile`, allowing async byte sources such as async object
+  storage readers to be uploaded as streaming multipart file parts with
+  `httpx.AsyncClient`, with optional `filename`, `content_type`, per-part
+  `headers`, and known `content_length` support.
+
 ## 0.28.1 (6th December, 2024)
 
 * Fix SSL case where `verify=False` together with client side certificates.

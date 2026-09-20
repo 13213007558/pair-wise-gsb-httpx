@@ -322,3 +322,17 @@ For instance this request sends 2 files, `foo.png` and `bar.png` in one request 
                       ('images', ('bar.png', open('bar.png', 'rb'), 'image/png'))]
 >>> r = httpx.post("https://httpbin.org/post", files=files)
 ```
+
+When using `httpx.AsyncClient`, an async byte source such as an async object
+storage reader can be uploaded as a streaming file part with `httpx.AsyncFile`,
+mixed freely with any of the other styles of file and data fields:
+
+```python
+async with httpx.AsyncClient() as client:
+    source = await bucket.open_read("report.csv")
+    file = httpx.AsyncFile(source, filename="report.csv", content_length=size)
+    await client.post("https://httpbin.org/post", files={"upload-file": file})
+```
+
+See the [async documentation](../async.md#streaming-multipart-file-uploads)
+for more details.

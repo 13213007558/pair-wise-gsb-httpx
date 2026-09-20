@@ -4,9 +4,11 @@ import io
 import tempfile
 import typing
 
+import anyio
 import pytest
 
 import httpx
+from tests.concurrency import sleep
 
 
 def echo_request_content(request: httpx.Request) -> httpx.Response:
@@ -467,3 +469,351 @@ class TestHeaderParamHTML5Formatting:
         files = {"upload": (filename, b"<file content>")}
         request = httpx.Request("GET", "https://www.example.com", files=files)
         assert expected in request.read()
+
+
+class ControlledAsyncReader:
+    """
+    A controlled async byte source, mimicking an async object storage reader.
+
+    Records every read, yields to the event loop on each read, and tracks
+    closure, so that tests can assert non-blocking streaming behavior and
+    reliable closing.
+    """
+
+    def __init__(self, chunks: typing.List[bytes], read_delay: float = 0.0) -> None:
+        self._buffer = b"".join(chunks)
+        self._read_delay = read_delay
+        self.reads: typing.List[int] = []
+        self.closed = False
+
+    async def aread(self, n: int = -1) -> bytes:
+        await sleep(self._read_delay)
+        self.reads.append(n)
+        if n < 0:
+            n = len(self._buffer)
+        chunk, self._buffer = self._buffer[:n], self._buffer[n:]
+        return chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_mixed_with_other_parts():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files: typing.List[typing.Tuple[str, typing.Any]] = [
+        ("plain", b"<bytes content>"),
+        ("upload", ("name.txt", io.BytesIO(b"<file content>"))),
+        (
+            "upload",
+            httpx.AsyncFile(reader, filename="async.txt", content_length=20),
+        ),
+    ]
+    request = httpx.Request(
+        "POST",
+        "https://www.example.com/",
+        headers={"Content-Type": "multipart/form-data; boundary=BOUNDARY"},
+        data={"text": "abc"},
+        files=files,
+    )
+    await request.aread()
+
+    # Field order, duplicate field names, and escaping are preserved,
+    # and all lengths are known, so an accurate Content-Length is sent.
+    assert request.headers["Content-Length"] == str(len(request.content))
+    assert request.content == (
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="text"\r\n'
+        b"\r\n"
+        b"abc\r\n"
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="plain"; filename="upload"\r\n'
+        b"Content-Type: application/octet-stream\r\n"
+        b"\r\n"
+        b"<bytes content>\r\n"
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="upload"; filename="name.txt"\r\n'
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"<file content>\r\n"
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="upload"; filename="async.txt"\r\n'
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"<async file content>\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_with_async_client():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {"file": httpx.AsyncFile(reader, filename="name.txt", content_length=20)}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(echo_request_content)
+    ) as client:
+        response = await client.post(
+            "http://127.0.0.1:8000/", data={"text": "abc"}, files=files
+        )
+
+    boundary = response.request.headers["Content-Type"].split("boundary=")[-1]
+    boundary_bytes = boundary.encode("ascii")
+
+    assert response.status_code == 200
+    assert "Content-Length" in response.request.headers
+    assert response.content == b"".join(
+        [
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="text"\r\n',
+            b"\r\n",
+            b"abc\r\n",
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="name.txt"\r\n',
+            b"Content-Type: text/plain\r\n",
+            b"\r\n",
+            b"<async file content>\r\n",
+            b"--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_unknown_content_length():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {"file": httpx.AsyncFile(reader, filename="name.txt")}
+    request = httpx.Request(
+        "POST",
+        "https://www.example.com/",
+        headers={"Content-Type": "multipart/form-data; boundary=BOUNDARY"},
+        files=files,
+    )
+
+    # An unknown part length means a streamed, chunked transfer encoding.
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        "Transfer-Encoding": "chunked",
+    }
+
+    await request.aread()
+    assert request.content == (
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="name.txt"\r\n'
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"<async file content>\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_from_async_generator():
+    closed = False
+
+    async def stream() -> typing.AsyncIterator[bytes]:
+        nonlocal closed
+        try:
+            yield b"<async "
+            yield b"file content>"
+        finally:
+            closed = True
+
+    files = {"file": httpx.AsyncFile(stream(), filename="name.txt")}
+    request = httpx.Request(
+        "POST",
+        "https://www.example.com/",
+        headers={"Content-Type": "multipart/form-data; boundary=BOUNDARY"},
+        files=files,
+    )
+    await request.aread()
+
+    assert request.content == (
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="name.txt"\r\n'
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"<async file content>\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+    assert closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_reads_do_not_block_the_event_loop():
+    reader = ControlledAsyncReader([b"x" * 4096] * 4, read_delay=0.01)
+    files = {"file": httpx.AsyncFile(reader, filename="name.bin")}
+    request = httpx.Request("POST", "https://www.example.com/", files=files)
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stopped:
+            await sleep(0.001)
+            ticks += 1
+
+    stopped = False
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(ticker)
+        await request.aread()
+        stopped = True
+
+    # If reading the source blocked the event loop, then the ticker
+    # would never have been scheduled while the upload was encoded.
+    assert ticks > 0
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_content_length_too_short():
+    reader = ControlledAsyncReader([b"short"])
+    files = {"file": httpx.AsyncFile(reader, filename="name.bin", content_length=100)}
+    request = httpx.Request("POST", "https://www.example.com/", files=files)
+
+    with pytest.raises(httpx.StreamError, match="exhausted after 5 bytes"):
+        await request.aread()
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_content_length_too_long():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {"file": httpx.AsyncFile(reader, filename="name.bin", content_length=2)}
+    request = httpx.Request("POST", "https://www.example.com/", files=files)
+
+    with pytest.raises(httpx.StreamError, match="more data than declared"):
+        await request.aread()
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_closed_on_cancellation():
+    reader = ControlledAsyncReader([b"x" * 4096] * 100)
+    files = {"file": httpx.AsyncFile(reader, filename="name.bin")}
+    request = httpx.Request("POST", "https://www.example.com/", files=files)
+
+    stream = request.stream
+    assert isinstance(stream, httpx.AsyncByteStream)
+    aiterator = typing.cast(typing.AsyncGenerator[bytes, None], stream.__aiter__())
+    # Read far enough to have started streaming the file part,
+    # then cancel the upload by closing the stream.
+    for _ in range(4):
+        await aiterator.__anext__()
+    await aiterator.aclose()
+
+    assert reader.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_cannot_be_replayed():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {"file": httpx.AsyncFile(reader, filename="name.txt")}
+    request = httpx.Request("POST", "https://www.example.com/", files=files)
+
+    # A read-once async source must not be silently replayed.
+    stream = request.stream
+    assert isinstance(stream, httpx.AsyncByteStream)
+    [chunk async for chunk in stream]
+    with pytest.raises(httpx.StreamConsumed):
+        [chunk async for chunk in stream]
+
+
+def test_multipart_async_file_with_sync_client():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+    files = {"file": httpx.AsyncFile(reader, filename="name.txt")}
+
+    with pytest.raises(RuntimeError, match="httpx.AsyncClient"):
+        client.post("http://127.0.0.1:8000/", files=files)
+
+    # The request fails before anything is sent, without touching the source.
+    assert reader.reads == []
+    assert not reader.closed
+
+
+def test_multipart_async_file_sync_iteration():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {"file": httpx.AsyncFile(reader, filename="name.txt")}
+    request = httpx.Request("POST", "https://www.example.com/", files=files)
+
+    stream = request.stream
+    assert isinstance(stream, httpx.SyncByteStream)
+    with pytest.raises(RuntimeError, match="httpx.AsyncClient"):
+        b"".join(stream)
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_headers_and_content_type():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {
+        "file": httpx.AsyncFile(
+            reader,
+            filename="report.csv",
+            content_type="text/csv",
+            headers={"X-Custom": "example"},
+        )
+    }
+    request = httpx.Request(
+        "POST",
+        "https://www.example.com/",
+        headers={"Content-Type": "multipart/form-data; boundary=BOUNDARY"},
+        files=files,
+    )
+    await request.aread()
+
+    assert request.content == (
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="report.csv"\r\n'
+        b"X-Custom: example\r\n"
+        b"Content-Type: text/csv\r\n"
+        b"\r\n"
+        b"<async file content>\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_content_type_header_takes_precedence():
+    reader = ControlledAsyncReader([b"<async file content>"])
+    files = {
+        "file": httpx.AsyncFile(
+            reader,
+            filename="report.csv",
+            content_type="text/csv",
+            headers={"Content-Type": "image/png"},
+        )
+    }
+    request = httpx.Request(
+        "POST",
+        "https://www.example.com/",
+        headers={"Content-Type": "multipart/form-data; boundary=BOUNDARY"},
+        files=files,
+    )
+    await request.aread()
+
+    assert b"Content-Type: image/png\r\n" in request.content
+    assert b"text/csv" not in request.content
+
+
+@pytest.mark.anyio
+async def test_multipart_async_file_filename_escaping():
+    reader = ControlledAsyncReader([b"<file content>"])
+    files = {"upload": httpx.AsyncFile(reader, filename='hello\\world"')}
+    request = httpx.Request("GET", "https://www.example.com", files=files)
+    await request.aread()
+    assert b'filename="hello\\\\world%22"' in request.content
+
+
+def test_multipart_async_file_invalid_source():
+    with pytest.raises(TypeError, match="Invalid type for 'source'"):
+        httpx.AsyncFile(b"<sync bytes>")
+
+
+def test_multipart_async_file_invalid_content_length():
+    reader = ControlledAsyncReader([])
+    with pytest.raises(ValueError, match="Invalid 'content_length'"):
+        httpx.AsyncFile(reader, content_length=-1)

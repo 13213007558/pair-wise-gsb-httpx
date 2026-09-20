@@ -115,6 +115,45 @@ async def upload_bytes():
 await client.post(url, content=upload_bytes())
 ```
 
+### Streaming multipart file uploads
+
+When uploading files with an `AsyncClient`, async byte sources such as async
+object storage readers can be included directly in the multipart form using
+`httpx.AsyncFile`. The content is encoded as it is read, without loading the
+entire file into memory, and without blocking the event loop:
+
+```python
+async with httpx.AsyncClient() as client:
+    source = await bucket.open_read("report.csv")  # An object with `aread()`.
+    file = httpx.AsyncFile(source, filename="report.csv")
+    await client.post(url, data={"description": "Monthly"}, files={"upload": file})
+```
+
+The `source` may be an async iterable of `bytes`, or a file-like object with
+an async `aread()` method. It can be freely mixed with regular form fields,
+`bytes`, and file tuples. An optional `content_type`, per-part `headers`,
+and a known `content_length` may also be provided:
+
+```python
+file = httpx.AsyncFile(
+    source,
+    filename="report.csv",
+    content_type="text/csv",
+    headers={"Content-Disposition": 'attachment; filename="report.csv"'},
+    content_length=size,
+)
+```
+
+If every part has a known length then an accurate `Content-Length` header is
+sent, otherwise the upload uses a streamed `Transfer-Encoding: chunked`. If a
+declared `content_length` does not match the actual content, the request
+fails with `httpx.StreamError` rather than sending a corrupt message body.
+
+The source is closed exactly once, when the upload completes, fails, or is
+cancelled. Async sources are read-once streams, so requests including an
+`AsyncFile` part cannot be automatically retried or replayed, and require an
+`AsyncClient` instance.
+
 ### Explicit transport instances
 
 When instantiating a transport instance directly, you need to use `httpx.AsyncHTTPTransport`.

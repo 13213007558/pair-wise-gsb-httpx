@@ -25,6 +25,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from ._auth import Auth  # noqa: F401
     from ._config import Proxy, Timeout  # noqa: F401
     from ._models import Cookies, Headers, Request  # noqa: F401
+    from ._multipart import AsyncFile  # noqa: F401
     from ._urls import URL, QueryParams  # noqa: F401
 
 
@@ -75,6 +76,8 @@ FileContent = Union[IO[bytes], bytes, str]
 FileTypes = Union[
     # file (or bytes)
     FileContent,
+    # async file part, eg. httpx.AsyncFile(...)
+    "AsyncFile",
     # (filename, file (or bytes))
     Tuple[Optional[str], FileContent],
     # (filename, file (or bytes), content_type)
