@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+* Multipart file fields now support iterators and async iterators as file content, in addition to bytes, strings, and file-like objects.
+* Multipart sources with an unknown length are sent using `Transfer-Encoding: chunked`, and are never read ahead of time in order to determine a `Content-Length`.
+* Multipart file sources and request content generators are now reliably closed once the request has been sent, including when the send is cancelled or fails part-way through. Any file or stream is closed at most once.
+* Non-replayable request bodies, such as non-seekable files, iterators, and async iterators, now raise `httpx.StreamConsumed` if a redirect or authentication flow requires the request body to be re-sent, rather than silently sending an empty or partial body. A zero-argument factory may be used as multipart file content to support re-sending.
+
 ## 0.28.1 (6th December, 2024)
 
 * Fix SSL case where `verify=False` together with client side certificates.

@@ -311,6 +311,36 @@ MIME header field.
 !!! tip
     It is safe to upload large files this way. File uploads are streaming by default, meaning that only one chunk will be loaded into memory at a time.
 
+File content may also be given as an iterator or async iterator of bytes,
+which is useful when streaming content that is generated on the fly:
+
+```python
+async def file_chunks():
+    yield b"..."  # Some bytes content, loaded or generated incrementally.
+
+files = {"upload-file": ("report.xls", file_chunks())}
+
+async with httpx.AsyncClient() as client:
+    response = await client.post("https://httpbin.org/post", files=files)
+```
+
+Sources with a length that cannot be determined upfront, such as
+non-seekable file-like objects, iterators, and async iterators, are sent
+using `Transfer-Encoding: chunked` rather than a `Content-Length` header.
+The source is never read ahead of time, and is always closed once the
+request has been sent, or if the send is cancelled or fails part-way through.
+
+Note that these sources are not replayable. If a request needs to be sent
+again, for example because a redirect or an authentication flow requires
+the request body to be re-sent, then an `httpx.StreamConsumed` exception
+is raised, rather than silently sending an empty or partial body. If you
+need uploads that can be re-sent, either use seekable file-like objects,
+or pass a zero-argument factory that returns a fresh source for each send:
+
+```python
+files = {"upload-file": ("report.xls", lambda: open("report.xls", "rb"))}
+```
+
  Non-file data fields can be included in the multipart form using by passing them to `data=...`.
 
 You can also send multiple files in one go with a multiple file field form.

@@ -467,3 +467,393 @@ class TestHeaderParamHTML5Formatting:
         files = {"upload": (filename, b"<file content>")}
         request = httpx.Request("GET", "https://www.example.com", files=files)
         assert expected in request.read()
+
+
+def tracked_async_file(
+    chunks: typing.List[bytes], log: typing.List[tuple]
+) -> typing.AsyncIterator[bytes]:
+    """
+    An async generator that records 'read' and 'close' events,
+    so that tests can assert on the resource lifecycle.
+    """
+
+    async def gen() -> typing.AsyncIterator[bytes]:
+        try:
+            for chunk in chunks:
+                log.append(("read", chunk))
+                yield chunk
+        finally:
+            log.append(("close",))
+
+    return gen()
+
+
+@pytest.mark.anyio
+async def test_multipart_encode_async_iterator_file() -> None:
+    """
+    Non-seekable async iterators are supported as multipart file content.
+    The length is unknown upfront, so 'Transfer-Encoding: chunked' is used,
+    and the source is not read until the request is sent.
+    """
+    log: typing.List[tuple] = []
+    fileobj = tracked_async_file([b"Hello", b"World"], log)
+
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    files = {"file": ("name.txt", fileobj)}
+
+    request = httpx.Request("POST", url, headers=headers, files=files)
+
+    # The source must not be pre-read when building the request.
+    assert log == []
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        "Transfer-Encoding": "chunked",
+    }
+
+    content = b"".join([part async for part in request.stream])
+    assert content == (
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="name.txt"\r\n'
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"HelloWorld\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+    assert log == [("read", b"Hello"), ("read", b"World"), ("close",)]
+
+    # The source is only ever closed once.
+    await request.stream.aclose()
+    assert log.count(("close",)) == 1
+
+
+@pytest.mark.anyio
+async def test_multipart_encode_async_iterator_file_empty() -> None:
+    """
+    Zero-byte async iterator sources use chunked encoding,
+    and are still closed exactly once.
+    """
+    log: typing.List[tuple] = []
+    fileobj = tracked_async_file([], log)
+
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    files = {"file": ("name.txt", fileobj)}
+
+    request = httpx.Request("POST", url, headers=headers, files=files)
+    assert request.headers["Transfer-Encoding"] == "chunked"
+    assert "Content-Length" not in request.headers
+
+    content = b"".join([part async for part in request.stream])
+    assert content == (
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="name.txt"\r\n'
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+    assert log == [("close",)]
+
+
+@pytest.mark.anyio
+async def test_multipart_encode_async_filelike_across_chunks() -> None:
+    """
+    Async file-like objects using 'aread' are read across multiple chunks,
+    and closed exactly once.
+    """
+
+    class AsyncFile:
+        def __init__(self, content: bytes) -> None:
+            self._content = content
+            self._pos = 0
+            self.reads: typing.List[bytes] = []
+            self.closes = 0
+
+        async def aread(self, chunk_size: int) -> bytes:
+            chunk = self._content[self._pos : self._pos + chunk_size]
+            self._pos += len(chunk)
+            self.reads.append(chunk)
+            return chunk
+
+        async def aclose(self) -> None:
+            self.closes += 1
+
+    content = b"x" * (64 * 1024 * 2 + 1)
+    fileobj = AsyncFile(content)
+
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    files = {"file": ("name.txt", fileobj)}
+
+    request = httpx.Request("POST", url, headers=headers, files=files)
+    assert request.headers["Transfer-Encoding"] == "chunked"
+    assert fileobj.reads == []
+
+    body = b"".join([part async for part in request.stream])
+    assert body.count(b"x" * 64 * 1024) >= 2
+    assert content in body
+    assert len(fileobj.reads) == 4  # 64k, 64k, 1 byte, then b""
+    assert fileobj.closes == 1
+
+    await request.stream.aclose()
+    assert fileobj.closes == 1
+
+
+@pytest.mark.anyio
+async def test_multipart_encode_async_iterator_cancelled() -> None:
+    """
+    Cancelling a multipart send part-way through closes the source,
+    exactly once.
+    """
+    log: typing.List[tuple] = []
+    fileobj = tracked_async_file([b"x" * 1024] * 100, log)
+
+    url = "https://www.example.com/"
+    files = {"file": ("name.txt", fileobj)}
+    request = httpx.Request("POST", url, files=files)
+
+    stream = request.stream.__aiter__()
+    await stream.__anext__()  # Boundary.
+    await stream.__anext__()  # File headers.
+    await stream.__anext__()  # First file chunk.
+    await stream.aclose()
+
+    assert log.count(("close",)) == 1
+
+    await request.stream.aclose()
+    assert log.count(("close",)) == 1
+
+
+@pytest.mark.anyio
+async def test_multipart_encode_async_iterator_not_replayable() -> None:
+    """
+    Non-replayable async iterators cannot be sent twice. Re-sending raises
+    'StreamConsumed' rather than silently sending an empty body.
+    """
+    log: typing.List[tuple] = []
+    fileobj = tracked_async_file([b"Hello"], log)
+
+    url = "https://www.example.com/"
+    files = {"file": ("name.txt", fileobj)}
+    request = httpx.Request("POST", url, files=files)
+
+    content = b"".join([part async for part in request.stream])
+    assert b"Hello" in content
+
+    with pytest.raises(httpx.StreamConsumed):
+        [part async for part in request.stream]
+
+    assert log.count(("close",)) == 1
+
+
+def test_multipart_encode_async_iterator_sync_read_raises() -> None:
+    """
+    Async file sources cannot be read by a synchronous stream.
+    """
+    log: typing.List[tuple] = []
+    fileobj = tracked_async_file([b"Hello"], log)
+
+    url = "https://www.example.com/"
+    files = {"file": ("name.txt", fileobj)}
+    request = httpx.Request("POST", url, files=files)
+
+    with pytest.raises(RuntimeError):
+        request.read()
+
+
+def test_multipart_encode_sync_iterator_file() -> None:
+    """
+    Sync iterators are supported as multipart file content, using
+    'Transfer-Encoding: chunked', and are closed once consumed.
+    """
+    log: typing.List[str] = []
+
+    def data() -> typing.Iterator[bytes]:
+        try:
+            yield b"Hello"
+            yield b"World"
+        finally:
+            log.append("closed")
+
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    files = {"file": ("name.txt", data())}
+
+    request = httpx.Request("POST", url, headers=headers, files=files)
+    assert request.headers["Transfer-Encoding"] == "chunked"
+    assert log == []
+
+    content = request.read()
+    assert content == (
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="name.txt"\r\n'
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"HelloWorld\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+    assert log == ["closed"]
+
+
+def test_multipart_encode_non_seekable_filelike_not_replayable() -> None:
+    """
+    Non-seekable file-like objects cannot be sent twice. Re-sending raises
+    'StreamConsumed' rather than silently sending an empty body.
+    """
+
+    class IteratorIO(io.IOBase):
+        def __init__(self, iterator: typing.Iterator[bytes]) -> None:
+            self._iterator = iterator
+
+        def read(self, *args: typing.Any) -> bytes:
+            return b"".join(self._iterator)
+
+    def data() -> typing.Iterator[bytes]:
+        yield b"Hello"
+
+    url = "https://www.example.com/"
+    files = {"file": IteratorIO(data())}
+    request = httpx.Request("POST", url, files=files)
+
+    assert b"Hello" in b"".join(request.stream)
+
+    with pytest.raises(httpx.StreamConsumed):
+        b"".join(request.stream)
+
+
+def test_multipart_stream_closed_exactly_once() -> None:
+    """
+    Closing a multipart stream closes any non-replayable sources,
+    exactly once, even if the stream was never consumed.
+    """
+
+    class NonSeekableFile(io.IOBase):
+        closes = 0
+
+        def read(self, *args: typing.Any) -> bytes:
+            return b""
+
+        def close(self) -> None:
+            self.closes += 1
+
+    fileobj = NonSeekableFile()
+    url = "https://www.example.com/"
+    files = {"file": ("name.txt", fileobj)}
+    request = httpx.Request("POST", url, files=files)
+
+    request.stream.close()
+    request.stream.close()
+    assert fileobj.closes == 1
+
+
+def test_multipart_redirect_non_replayable_raises() -> None:
+    """
+    Redirects that require the request body to be re-sent raise
+    'StreamConsumed' for non-replayable sources, rather than
+    silently sending an empty body.
+    """
+    bodies: typing.List[bytes] = []
+
+    class ConsumeBodyTransport(httpx.MockTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            bodies.append(b"".join(request.stream))
+            return self.handler(request)  # type: ignore[return-value]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            return httpx.Response(308, headers={"location": "/target"})
+        return httpx.Response(200)
+
+    class IteratorIO(io.IOBase):
+        def __init__(self, iterator: typing.Iterator[bytes]) -> None:
+            self._iterator = iterator
+
+        def read(self, *args: typing.Any) -> bytes:
+            return b"".join(self._iterator)
+
+    def data() -> typing.Iterator[bytes]:
+        yield b"Hello"
+
+    client = httpx.Client(transport=ConsumeBodyTransport(handler))
+    files = {"file": ("name.txt", IteratorIO(data()))}
+    with pytest.raises(httpx.StreamConsumed):
+        client.post("http://example.org/redirect", files=files, follow_redirects=True)
+
+    assert len(bodies) == 1
+    assert b"Hello" in bodies[0]
+
+
+@pytest.mark.anyio
+async def test_multipart_redirect_async_iterator_raises() -> None:
+    """
+    Redirects that require the request body to be re-sent raise
+    'StreamConsumed' for non-replayable async sources, rather than
+    silently sending an empty body.
+    """
+    bodies: typing.List[bytes] = []
+
+    class ConsumeBodyTransport(httpx.MockTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            bodies.append(b"".join([part async for part in request.stream]))
+            return self.handler(request)  # type: ignore[return-value]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            return httpx.Response(308, headers={"location": "/target"})
+        return httpx.Response(200)
+
+    log: typing.List[tuple] = []
+    fileobj = tracked_async_file([b"Hello"], log)
+
+    async with httpx.AsyncClient(transport=ConsumeBodyTransport(handler)) as client:
+        files = {"file": ("name.txt", fileobj)}
+        with pytest.raises(httpx.StreamConsumed):
+            await client.post(
+                "http://example.org/redirect", files=files, follow_redirects=True
+            )
+
+    assert len(bodies) == 1
+    assert b"Hello" in bodies[0]
+    assert log.count(("close",)) == 1
+
+
+def test_multipart_redirect_with_factory() -> None:
+    """
+    A caller-provided factory allows non-replayable sources to be
+    re-sent across redirects. Each instance is closed exactly once.
+    """
+    bodies: typing.List[bytes] = []
+
+    class ConsumeBodyTransport(httpx.MockTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            bodies.append(b"".join(request.stream))
+            return self.handler(request)  # type: ignore[return-value]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            return httpx.Response(308, headers={"location": "/target"})
+        return httpx.Response(200)
+
+    instances: typing.List[io.BytesIO] = []
+
+    def factory() -> io.BytesIO:
+        instance = io.BytesIO(b"<file content>")
+        instances.append(instance)
+        return instance
+
+    client = httpx.Client(transport=ConsumeBodyTransport(handler))
+    files = {"file": ("name.txt", factory)}
+    response = client.post(
+        "http://example.org/redirect", files=files, follow_redirects=True
+    )
+
+    assert response.status_code == 200
+    assert len(bodies) == 2
+    assert bodies[0] == bodies[1]
+    assert b"<file content>" in bodies[1]
+    assert len(instances) == 2
+    assert all(instance.closed for instance in instances)

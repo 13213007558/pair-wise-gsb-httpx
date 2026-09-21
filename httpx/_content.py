@@ -45,23 +45,66 @@ class IteratorByteStream(SyncByteStream):
     def __init__(self, stream: Iterable[bytes]) -> None:
         self._stream = stream
         self._is_stream_consumed = False
+        self._is_stream_closed = False
         self._is_generator = inspect.isgenerator(stream)
 
+    def _is_replayable(self) -> bool:
+        if self._is_generator:
+            return False
+        if hasattr(self._stream, "read"):
+            # File-like objects are replayable if they are seekable.
+            seekable = getattr(self._stream, "seekable", None)
+            if callable(seekable):
+                try:
+                    return bool(seekable())
+                except Exception:  # pragma: no cover
+                    return False
+            return hasattr(self._stream, "seek")
+        # Re-iterable collections are replayable. Iterators are not.
+        try:
+            return iter(self._stream) is not self._stream
+        except TypeError:  # pragma: no cover
+            return False
+
     def __iter__(self) -> Iterator[bytes]:
-        if self._is_stream_consumed and self._is_generator:
+        if self._is_stream_consumed and not self._is_replayable():
+            # Non-replayable streams cannot be re-sent, for example across
+            # a redirect or an authentication flow. Raise an explicit error,
+            # rather than silently sending an empty or partial body.
             raise StreamConsumed()
 
         self._is_stream_consumed = True
-        if hasattr(self._stream, "read"):
-            # File-like interfaces should use 'read' directly.
-            chunk = self._stream.read(self.CHUNK_SIZE)
-            while chunk:
-                yield chunk
+        try:
+            if hasattr(self._stream, "read"):
+                # File-like interfaces should use 'read' directly.
+                if hasattr(self._stream, "seek"):
+                    # Ensure seekable streams are replayed from the start,
+                    # matching the 'Content-Length' that was determined upfront.
+                    try:
+                        self._stream.seek(0)
+                    except (OSError, ValueError):
+                        pass
                 chunk = self._stream.read(self.CHUNK_SIZE)
-        else:
-            # Otherwise iterate.
-            for part in self._stream:
-                yield part
+                while chunk:
+                    yield chunk
+                    chunk = self._stream.read(self.CHUNK_SIZE)
+            else:
+                # Otherwise iterate.
+                for part in self._stream:
+                    yield part
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        # Generators are non-replayable, and are closed once consumed,
+        # including when iteration is cancelled or fails part-way through.
+        # Any stream is only ever closed once.
+        if not self._is_stream_closed:
+            self._is_stream_closed = True
+            if self._is_generator:
+                close = getattr(self._stream, "close", None)
+                if close is not None:
+                    close()
 
 
 class AsyncIteratorByteStream(AsyncByteStream):
@@ -70,6 +113,7 @@ class AsyncIteratorByteStream(AsyncByteStream):
     def __init__(self, stream: AsyncIterable[bytes]) -> None:
         self._stream = stream
         self._is_stream_consumed = False
+        self._is_stream_closed = False
         self._is_generator = inspect.isasyncgen(stream)
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
@@ -77,16 +121,30 @@ class AsyncIteratorByteStream(AsyncByteStream):
             raise StreamConsumed()
 
         self._is_stream_consumed = True
-        if hasattr(self._stream, "aread"):
-            # File-like interfaces should use 'aread' directly.
-            chunk = await self._stream.aread(self.CHUNK_SIZE)
-            while chunk:
-                yield chunk
+        try:
+            if hasattr(self._stream, "aread"):
+                # File-like interfaces should use 'aread' directly.
                 chunk = await self._stream.aread(self.CHUNK_SIZE)
-        else:
-            # Otherwise iterate.
-            async for part in self._stream:
-                yield part
+                while chunk:
+                    yield chunk
+                    chunk = await self._stream.aread(self.CHUNK_SIZE)
+            else:
+                # Otherwise iterate.
+                async for part in self._stream:
+                    yield part
+        finally:
+            await self.aclose()
+
+    async def aclose(self) -> None:
+        # Async generators are non-replayable, and are closed once consumed,
+        # including when iteration is cancelled or fails part-way through.
+        # Any stream is only ever closed once.
+        if not self._is_stream_closed:
+            self._is_stream_closed = True
+            if self._is_generator:
+                aclose = getattr(self._stream, "aclose", None)
+                if aclose is not None:
+                    await aclose()
 
 
 class UnattachedStream(AsyncByteStream, SyncByteStream):

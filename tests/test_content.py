@@ -516,3 +516,106 @@ def test_allow_nan_false():
         ValueError, match="Out of range float values are not JSON compliant"
     ):
         httpx.Response(200, json=data_with_inf)
+
+
+def test_iterator_content_closed_once_consumed():
+    log = []
+
+    def gen() -> typing.Iterator[bytes]:
+        try:
+            yield b"Hello"
+            yield b"World"
+        finally:
+            log.append("closed")
+
+    request = httpx.Request(method, url, content=gen())
+    assert b"".join(request.stream) == b"HelloWorld"
+    assert log == ["closed"]
+
+    # The stream is only ever closed once.
+    request.stream.close()
+    assert log == ["closed"]
+
+
+def test_iterator_content_closed_on_cancel():
+    log = []
+
+    def gen() -> typing.Iterator[bytes]:
+        try:
+            yield b"Hello"
+            yield b"World"
+        finally:
+            log.append("closed")
+
+    request = httpx.Request(method, url, content=gen())
+    stream = iter(request.stream)
+    assert next(stream) == b"Hello"
+    stream.close()
+    assert log == ["closed"]
+
+
+@pytest.mark.anyio
+async def test_aiterator_content_closed_once_consumed():
+    log = []
+
+    async def gen() -> typing.AsyncIterator[bytes]:
+        try:
+            yield b"Hello"
+            yield b"World"
+        finally:
+            log.append("closed")
+
+    request = httpx.Request(method, url, content=gen())
+    content = b"".join([part async for part in request.stream])
+    assert content == b"HelloWorld"
+    assert log == ["closed"]
+
+    # The stream is only ever closed once.
+    await request.stream.aclose()
+    assert log == ["closed"]
+
+
+@pytest.mark.anyio
+async def test_aiterator_content_closed_on_cancel():
+    log = []
+
+    async def gen() -> typing.AsyncIterator[bytes]:
+        try:
+            yield b"Hello"
+            yield b"World"
+        finally:
+            log.append("closed")
+
+    request = httpx.Request(method, url, content=gen())
+    stream = request.stream.__aiter__()
+    assert await stream.__anext__() == b"Hello"
+    await stream.aclose()
+    assert log == ["closed"]
+
+
+def test_filelike_content_replays_from_start():
+    content = io.BytesIO(b"Hello, world!")
+    request = httpx.Request(method, url, content=content)
+
+    first = b"".join(request.stream)
+    second = b"".join(request.stream)
+    assert first == b"Hello, world!"
+    assert second == b"Hello, world!"
+
+
+def test_non_seekable_filelike_content_not_replayable():
+    class IteratorIO(io.IOBase):
+        def __init__(self, iterator: typing.Iterator[bytes]) -> None:
+            self._iterator = iterator
+
+        def read(self, *args: typing.Any) -> bytes:
+            return b"".join(self._iterator)
+
+    def gen() -> typing.Iterator[bytes]:
+        yield b"Hello"
+
+    request = httpx.Request(method, url, content=IteratorIO(gen()))
+    assert b"".join(request.stream) == b"Hello"
+
+    with pytest.raises(httpx.StreamConsumed):
+        b"".join(request.stream)

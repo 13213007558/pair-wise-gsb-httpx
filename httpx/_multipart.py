@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import io
 import mimetypes
 import os
@@ -7,6 +8,7 @@ import re
 import typing
 from pathlib import Path
 
+from ._exceptions import StreamConsumed
 from ._types import (
     AsyncByteStream,
     FileContent,
@@ -51,6 +53,54 @@ def _guess_content_type(filename: str | None) -> str | None:
     if filename:
         return mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return None
+
+
+def _is_factory(fileobj: typing.Any) -> bool:
+    """
+    A file object may be given as a zero-argument callable, returning a
+    fresh file-like object or iterator for each render. This allows
+    non-replayable sources to be re-sent, for example across redirects.
+    """
+    return (
+        callable(fileobj)
+        and not isinstance(fileobj, (str, bytes))
+        and not any(
+            hasattr(fileobj, attr)
+            for attr in ("read", "aread", "__iter__", "__aiter__")
+        )
+    )
+
+
+def _is_replayable(fileobj: typing.Any) -> bool:
+    """
+    Determine if a file source can be rendered more than once.
+
+    Replayable sources are `bytes`/`str`, seekable file-like objects,
+    and re-iterable collections. Non-replayable sources are iterators,
+    generators, async iterables, and non-seekable file-like objects.
+    """
+    if isinstance(fileobj, (str, bytes)):
+        return True
+
+    seekable = getattr(fileobj, "seekable", None)
+    if callable(seekable):
+        try:
+            return bool(seekable())
+        except Exception:  # pragma: no cover
+            return False
+
+    if hasattr(fileobj, "seek"):
+        return True
+
+    if any(hasattr(fileobj, attr) for attr in ("read", "aread", "__aiter__")):
+        return False
+
+    try:
+        # Iterators return themselves from `iter(...)`, and are single-use.
+        # Re-iterable collections return a fresh iterator each time.
+        return iter(fileobj) is not fileobj
+    except TypeError:  # pragma: no cover
+        return False
 
 
 def get_multipart_boundary_from_content_type(
@@ -111,6 +161,10 @@ class DataField:
         yield self.render_headers()
         yield self.render_data()
 
+    async def arender(self) -> typing.AsyncIterator[bytes]:
+        yield self.render_headers()
+        yield self.render_data()
+
 
 class FileField:
     """
@@ -168,8 +222,25 @@ class FileField:
         self.file = fileobj
         self.headers = headers
 
+        # A file source may be a zero-argument factory, returning a fresh
+        # file-like object or iterator on each render. This is the only way
+        # to make an otherwise non-replayable source re-usable, for example
+        # when a redirect or authentication flow requires re-sending the body.
+        self._is_factory = _is_factory(fileobj)
+        self._replayable = self._is_factory or _is_replayable(fileobj)
+        self._consumed = False
+        # Track every source instance we have closed, so that any file or
+        # stream is closed at most once. Strong references are kept so that
+        # identity checks remain valid for the lifetime of the field.
+        self._closed_files: list[typing.Any] = []
+
     def get_length(self) -> int | None:
         headers = self.render_headers()
+
+        if self._is_factory:
+            # The length of a factory-produced source cannot be determined
+            # without creating an instance, which we avoid doing upfront.
+            return None
 
         if isinstance(self.file, (str, bytes)):
             return len(headers) + len(to_bytes(self.file))
@@ -200,25 +271,147 @@ class FileField:
 
         return self._headers
 
-    def render_data(self) -> typing.Iterator[bytes]:
-        if isinstance(self.file, (str, bytes)):
-            yield to_bytes(self.file)
+    def _acquire_file(self) -> typing.Any:
+        if self._is_factory:
+            factory = typing.cast(typing.Callable[[], typing.Any], self.file)
+            return factory()
+        return self.file
+
+    def _mark_consumed(self) -> None:
+        if self._replayable:
             return
+        if self._consumed:
+            # Non-replayable sources may only be rendered once. Any attempt
+            # to re-send them, such as across a redirect or an authentication
+            # flow requiring the request body to be sent again, is an error,
+            # rather than silently sending an empty or partial body.
+            raise StreamConsumed()
+        self._consumed = True
 
-        if hasattr(self.file, "seek"):
-            try:
-                self.file.seek(0)
-            except io.UnsupportedOperation:
-                pass
+    def _should_close(self, fileobj: typing.Any) -> bool:
+        if isinstance(fileobj, (str, bytes)):
+            return False
+        if self._is_factory:
+            # Factory-produced instances are owned by this field.
+            return True
+        # Non-replayable sources are cleaned up once rendered, since they
+        # cannot be used again. Replayable caller-owned files are left open.
+        return not self._replayable
 
-        chunk = self.file.read(self.CHUNK_SIZE)
-        while chunk:
-            yield to_bytes(chunk)
-            chunk = self.file.read(self.CHUNK_SIZE)
+    def _close_file(self, fileobj: typing.Any) -> None:
+        if not self._should_close(fileobj):
+            return
+        if any(fileobj is closed for closed in self._closed_files):
+            return
+        close = getattr(fileobj, "close", None)
+        if close is not None:
+            self._closed_files.append(fileobj)
+            close()
+
+    async def _aclose_file(self, fileobj: typing.Any) -> None:
+        if not self._should_close(fileobj):
+            return
+        if any(fileobj is closed for closed in self._closed_files):
+            return
+        aclose = getattr(fileobj, "aclose", None)
+        close = getattr(fileobj, "close", None)
+        if aclose is not None:
+            self._closed_files.append(fileobj)
+            await aclose()
+        elif close is not None:
+            self._closed_files.append(fileobj)
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
+    def render_data(self) -> typing.Iterator[bytes]:
+        fileobj = self._acquire_file()
+        try:
+            if hasattr(fileobj, "__aiter__") or hasattr(fileobj, "aread"):
+                raise RuntimeError(
+                    "Attempted to read an asynchronous file "
+                    "in a synchronous multipart stream."
+                )
+
+            self._mark_consumed()
+
+            if isinstance(fileobj, (str, bytes)):
+                yield to_bytes(fileobj)
+                return
+
+            if hasattr(fileobj, "seek"):
+                try:
+                    fileobj.seek(0)
+                except io.UnsupportedOperation:
+                    pass
+
+            if hasattr(fileobj, "read"):
+                chunk = fileobj.read(self.CHUNK_SIZE)
+                while chunk:
+                    yield to_bytes(chunk)
+                    chunk = fileobj.read(self.CHUNK_SIZE)
+            else:
+                for chunk in fileobj:
+                    yield to_bytes(chunk)
+        finally:
+            self._close_file(fileobj)
+
+    async def arender_data(self) -> typing.AsyncIterator[bytes]:
+        fileobj = self._acquire_file()
+        try:
+            self._mark_consumed()
+
+            if isinstance(fileobj, (str, bytes)):
+                yield to_bytes(fileobj)
+                return
+
+            if hasattr(fileobj, "seek"):
+                try:
+                    fileobj.seek(0)
+                except io.UnsupportedOperation:
+                    pass
+
+            if hasattr(fileobj, "aread"):
+                chunk = await fileobj.aread(self.CHUNK_SIZE)
+                while chunk:
+                    yield to_bytes(chunk)
+                    chunk = await fileobj.aread(self.CHUNK_SIZE)
+            elif hasattr(fileobj, "__aiter__"):
+                async for chunk in fileobj:
+                    yield to_bytes(chunk)
+            elif hasattr(fileobj, "read"):
+                chunk = fileobj.read(self.CHUNK_SIZE)
+                while chunk:
+                    yield to_bytes(chunk)
+                    chunk = fileobj.read(self.CHUNK_SIZE)
+            else:
+                for chunk in fileobj:
+                    yield to_bytes(chunk)
+        finally:
+            await self._aclose_file(fileobj)
 
     def render(self) -> typing.Iterator[bytes]:
         yield self.render_headers()
         yield from self.render_data()
+
+    async def arender(self) -> typing.AsyncIterator[bytes]:
+        yield self.render_headers()
+        data = self.arender_data()
+        try:
+            async for chunk in data:
+                yield chunk
+        finally:
+            # Ensure the source is cleaned up, even if iteration
+            # is abandoned or cancelled part-way through.
+            await data.aclose()
+
+    def close(self) -> None:
+        if not self._is_factory:
+            self._close_file(self.file)
+
+    async def aclose(self) -> None:
+        if not self._is_factory:
+            await self._aclose_file(self.file)
 
 
 class MultipartStream(SyncByteStream, AsyncByteStream):
@@ -262,6 +455,18 @@ class MultipartStream(SyncByteStream, AsyncByteStream):
             yield b"\r\n"
         yield b"--%s--\r\n" % self.boundary
 
+    async def aiter_chunks(self) -> typing.AsyncIterator[bytes]:
+        for field in self.fields:
+            yield b"--%s\r\n" % self.boundary
+            rendered = field.arender()
+            try:
+                async for chunk in rendered:
+                    yield chunk
+            finally:
+                await rendered.aclose()
+            yield b"\r\n"
+        yield b"--%s--\r\n" % self.boundary
+
     def get_content_length(self) -> int | None:
         """
         Return the length of the multipart encoded content, or `None` if
@@ -292,9 +497,24 @@ class MultipartStream(SyncByteStream, AsyncByteStream):
         return {"Content-Length": str(content_length), "Content-Type": content_type}
 
     def __iter__(self) -> typing.Iterator[bytes]:
-        for chunk in self.iter_chunks():
-            yield chunk
+        yield from self.iter_chunks()
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        for chunk in self.iter_chunks():
-            yield chunk
+        chunks = self.aiter_chunks()
+        try:
+            async for chunk in chunks:
+                yield chunk
+        finally:
+            # Closing the stream also closes any inner generators,
+            # ensuring sources are cleaned up on cancellation.
+            await chunks.aclose()
+
+    def close(self) -> None:
+        for field in self.fields:
+            if isinstance(field, FileField):
+                field.close()
+
+    async def aclose(self) -> None:
+        for field in self.fields:
+            if isinstance(field, FileField):
+                await field.aclose()
