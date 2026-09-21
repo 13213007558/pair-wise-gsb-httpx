@@ -7,6 +7,7 @@ import re
 import typing
 from pathlib import Path
 
+from ._exceptions import StreamConsumed
 from ._types import (
     AsyncByteStream,
     FileContent,
@@ -167,12 +168,19 @@ class FileField:
         self.filename = filename
         self.file = fileobj
         self.headers = headers
+        self._is_async = hasattr(fileobj, "aread") or hasattr(fileobj, "__aiter__")
+        self._is_closed = False
 
     def get_length(self) -> int | None:
         headers = self.render_headers()
 
         if isinstance(self.file, (str, bytes)):
             return len(headers) + len(to_bytes(self.file))
+
+        if self._is_async:
+            # Asynchronous sources are never replayable or pre-read,
+            # so their length is always unknown up-front.
+            return None
 
         file_length = peek_filelike_length(self.file)
 
@@ -200,10 +208,38 @@ class FileField:
 
         return self._headers
 
+    @property
+    def is_replayable(self) -> bool:
+        """
+        Return True if the file content can be rendered more than once,
+        for example if a redirect or auth retry requires the request body
+        to be sent again.
+        """
+        if isinstance(self.file, (str, bytes)):
+            return True
+
+        if self._is_async:
+            return False
+
+        seekable = getattr(self.file, "seekable", None)
+        if seekable is not None:
+            try:
+                return bool(seekable())
+            except Exception:
+                return False
+
+        return hasattr(self.file, "seek")
+
     def render_data(self) -> typing.Iterator[bytes]:
         if isinstance(self.file, (str, bytes)):
             yield to_bytes(self.file)
             return
+
+        if self._is_async:
+            raise RuntimeError(
+                "Attempted to render an async file as part of a synchronous"
+                " multipart stream. Use an async client for async file uploads."
+            )
 
         if hasattr(self.file, "seek"):
             try:
@@ -211,14 +247,68 @@ class FileField:
             except io.UnsupportedOperation:
                 pass
 
-        chunk = self.file.read(self.CHUNK_SIZE)
-        while chunk:
-            yield to_bytes(chunk)
+        if hasattr(self.file, "read"):
             chunk = self.file.read(self.CHUNK_SIZE)
+            while chunk:
+                yield to_bytes(chunk)
+                chunk = self.file.read(self.CHUNK_SIZE)
+        else:
+            # Plain iterables of bytes are also supported.
+            for chunk in self.file:
+                yield to_bytes(chunk)
+
+    async def arender_data(self) -> typing.AsyncIterator[bytes]:
+        if isinstance(self.file, (str, bytes)):
+            yield to_bytes(self.file)
+            return
+
+        if hasattr(self.file, "aread"):
+            chunk = await self.file.aread(self.CHUNK_SIZE)
+            while chunk:
+                yield to_bytes(chunk)
+                chunk = await self.file.aread(self.CHUNK_SIZE)
+        elif hasattr(self.file, "__aiter__"):
+            async for chunk in self.file:
+                yield to_bytes(chunk)
+        else:
+            # Synchronous files may also be rendered asynchronously.
+            for chunk in self.render_data():
+                yield chunk
 
     def render(self) -> typing.Iterator[bytes]:
         yield self.render_headers()
         yield from self.render_data()
+
+    async def arender(self) -> typing.AsyncIterator[bytes]:
+        yield self.render_headers()
+        async for chunk in self.arender_data():
+            yield chunk
+
+    def close(self) -> None:
+        """
+        Close the underlying file, if it is closable.
+        Closing is idempotent, so any file is closed at most once.
+        """
+        if not self._is_closed:
+            self._is_closed = True
+            close = getattr(self.file, "close", None)
+            if close is not None:
+                close()
+
+    async def aclose(self) -> None:
+        """
+        Close the underlying file, if it is closable.
+        Closing is idempotent, so any file is closed at most once.
+        """
+        if not self._is_closed:
+            self._is_closed = True
+            aclose = getattr(self.file, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            else:
+                close = getattr(self.file, "close", None)
+                if close is not None:
+                    close()
 
 
 class MultipartStream(SyncByteStream, AsyncByteStream):
@@ -240,6 +330,14 @@ class MultipartStream(SyncByteStream, AsyncByteStream):
             "ascii"
         )
         self.fields = list(self._iter_fields(data, files))
+        self._is_stream_consumed = False
+        self._is_replayable = all(
+            not isinstance(field, FileField) or field.is_replayable
+            for field in self.fields
+        )
+        self._has_async_files = any(
+            isinstance(field, FileField) and field._is_async for field in self.fields
+        )
 
     def _iter_fields(
         self, data: RequestData, files: RequestFiles
@@ -255,10 +353,37 @@ class MultipartStream(SyncByteStream, AsyncByteStream):
         for name, value in file_items:
             yield FileField(name=name, value=value)
 
+    def _check_replayable(self) -> None:
+        if self._is_stream_consumed and not self._is_replayable:
+            # The stream includes content that cannot be replayed, such as
+            # non-seekable files or async iterators. Rather than silently
+            # sending an empty or partial body, we raise an explicit error.
+            raise StreamConsumed()
+        self._is_stream_consumed = True
+
     def iter_chunks(self) -> typing.Iterator[bytes]:
+        self._check_replayable()
+        if self._has_async_files:
+            raise RuntimeError(
+                "Attempted to call a sync iterator on an async multipart stream."
+                " Use an async client for async file uploads."
+            )
         for field in self.fields:
             yield b"--%s\r\n" % self.boundary
             yield from field.render()
+            yield b"\r\n"
+        yield b"--%s--\r\n" % self.boundary
+
+    async def aiter_chunks(self) -> typing.AsyncIterator[bytes]:
+        self._check_replayable()
+        for field in self.fields:
+            yield b"--%s\r\n" % self.boundary
+            if isinstance(field, FileField):
+                async for chunk in field.arender():
+                    yield chunk
+            else:
+                yield field.render_headers()
+                yield field.render_data()
             yield b"\r\n"
         yield b"--%s--\r\n" % self.boundary
 
@@ -296,5 +421,23 @@ class MultipartStream(SyncByteStream, AsyncByteStream):
             yield chunk
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        for chunk in self.iter_chunks():
+        async for chunk in self.aiter_chunks():
             yield chunk
+
+    def close(self) -> None:
+        """
+        Close any files opened as part of the multipart stream.
+        Each file is closed at most once.
+        """
+        for field in self.fields:
+            if isinstance(field, FileField):
+                field.close()
+
+    async def aclose(self) -> None:
+        """
+        Close any files opened as part of the multipart stream.
+        Each file is closed at most once.
+        """
+        for field in self.fields:
+            if isinstance(field, FileField):
+                await field.aclose()

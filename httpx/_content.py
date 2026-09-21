@@ -46,6 +46,7 @@ class IteratorByteStream(SyncByteStream):
         self._stream = stream
         self._is_stream_consumed = False
         self._is_generator = inspect.isgenerator(stream)
+        self._is_closed = False
 
     def __iter__(self) -> Iterator[bytes]:
         if self._is_stream_consumed and self._is_generator:
@@ -63,6 +64,17 @@ class IteratorByteStream(SyncByteStream):
             for part in self._stream:
                 yield part
 
+    def close(self) -> None:
+        """
+        Close the underlying stream or generator, if it is closable.
+        Closing is idempotent, so the stream is closed at most once.
+        """
+        if not self._is_closed:
+            self._is_closed = True
+            close = getattr(self._stream, "close", None)
+            if close is not None:
+                close()
+
 
 class AsyncIteratorByteStream(AsyncByteStream):
     CHUNK_SIZE = 65_536
@@ -71,6 +83,7 @@ class AsyncIteratorByteStream(AsyncByteStream):
         self._stream = stream
         self._is_stream_consumed = False
         self._is_generator = inspect.isasyncgen(stream)
+        self._is_closed = False
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         if self._is_stream_consumed and self._is_generator:
@@ -87,6 +100,17 @@ class AsyncIteratorByteStream(AsyncByteStream):
             # Otherwise iterate.
             async for part in self._stream:
                 yield part
+
+    async def aclose(self) -> None:
+        """
+        Close the underlying stream or async generator, if it is closable.
+        Closing is idempotent, so the stream is closed at most once.
+        """
+        if not self._is_closed:
+            self._is_closed = True
+            aclose = getattr(self._stream, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
 
 class UnattachedStream(AsyncByteStream, SyncByteStream):

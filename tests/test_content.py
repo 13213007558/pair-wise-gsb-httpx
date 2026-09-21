@@ -516,3 +516,60 @@ def test_allow_nan_false():
         ValueError, match="Out of range float values are not JSON compliant"
     ):
         httpx.Response(200, json=data_with_inf)
+
+
+def test_request_stream_closed_on_send_failure():
+    """
+    If sending the request fails, the request stream is closed,
+    closing the underlying generator exactly once.
+    """
+    closes = 0
+
+    def streaming_body() -> typing.Iterator[bytes]:
+        nonlocal closes
+        try:
+            yield b"Hello, "
+            yield b"world!"
+        finally:
+            closes += 1
+
+    class FailingTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            for _ in request.stream:
+                raise RuntimeError("Failed mid-upload")
+            return httpx.Response(200)  # pragma: no cover
+
+    client = httpx.Client(transport=FailingTransport())
+    with pytest.raises(RuntimeError):
+        client.post("http://127.0.0.1:8000/", content=streaming_body())
+
+    assert closes == 1
+
+
+@pytest.mark.anyio
+async def test_request_stream_aclosed_on_send_failure():
+    """
+    If sending the request fails, the request stream is closed,
+    closing the underlying async generator exactly once.
+    """
+    closes = 0
+
+    async def streaming_body() -> typing.AsyncIterator[bytes]:
+        nonlocal closes
+        try:
+            yield b"Hello, "
+            yield b"world!"
+        finally:
+            closes += 1
+
+    class FailingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            async for _ in request.stream:
+                raise RuntimeError("Failed mid-upload")
+            return httpx.Response(200)  # pragma: no cover
+
+    async with httpx.AsyncClient(transport=FailingTransport()) as client:
+        with pytest.raises(RuntimeError):
+            await client.post("http://127.0.0.1:8000/", content=streaming_body())
+
+    assert closes == 1

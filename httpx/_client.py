@@ -1010,8 +1010,16 @@ class Client(BaseClient):
                 "Attempted to send an async request with a sync Client instance."
             )
 
-        with request_context(request=request):
-            response = transport.handle_request(request)
+        try:
+            with request_context(request=request):
+                response = transport.handle_request(request)
+        except BaseException:
+            # If sending the request fails, including timeouts, cancellation,
+            # or a partially written request body, then make sure the request
+            # stream is closed, so that any underlying files, generators,
+            # or multipart streams are released exactly once.
+            request.stream.close()
+            raise
 
         assert isinstance(response.stream, SyncByteStream)
 
@@ -1726,8 +1734,16 @@ class AsyncClient(BaseClient):
                 "Attempted to send an sync request with an AsyncClient instance."
             )
 
-        with request_context(request=request):
-            response = await transport.handle_async_request(request)
+        try:
+            with request_context(request=request):
+                response = await transport.handle_async_request(request)
+        except BaseException:
+            # If sending the request fails, including timeouts, cancellation,
+            # or a partially written request body, then make sure the request
+            # stream is closed, so that any underlying files, generators,
+            # or multipart streams are released exactly once.
+            await request.stream.aclose()
+            raise
 
         assert isinstance(response.stream, AsyncByteStream)
         response.request = request
