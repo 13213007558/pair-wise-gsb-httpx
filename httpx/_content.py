@@ -63,6 +63,12 @@ class IteratorByteStream(SyncByteStream):
             for part in self._stream:
                 yield part
 
+    def close(self) -> None:
+        # Ensure generators are closed, so that abandoning a stream
+        # part-way through does not leave any resources in place.
+        if self._is_generator:
+            self._stream.close()  # type: ignore[attr-defined]
+
 
 class AsyncIteratorByteStream(AsyncByteStream):
     CHUNK_SIZE = 65_536
@@ -87,6 +93,12 @@ class AsyncIteratorByteStream(AsyncByteStream):
             # Otherwise iterate.
             async for part in self._stream:
                 yield part
+
+    async def aclose(self) -> None:
+        # Ensure async generators are closed, so that abandoning a stream
+        # part-way through does not leave any resources in place.
+        if self._is_generator:
+            await self._stream.aclose()  # type: ignore[attr-defined]
 
 
 class UnattachedStream(AsyncByteStream, SyncByteStream):

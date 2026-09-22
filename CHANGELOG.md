@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+* Add support for a `total` timeout budget on `httpx.Timeout`, shared across
+  redirects and tracked with a monotonic clock. Each phase of a request
+  (DNS, pool, connect, TLS, read, write) consumes its own remaining
+  allowance, given by `min(phase, total - elapsed)`. Contradictory
+  configurations, such as a per-operation timeout exceeding the `total`
+  budget, are rejected with a `ValueError`.
+* Response streams are now deterministically closed when abandoned part-way
+  through, including on cancellation or an exhausted timeout budget.
+
 ## 0.28.1 (6th December, 2024)
 
 * Fix SSL case where `verify=False` together with client side certificates.

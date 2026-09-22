@@ -51,9 +51,17 @@ HeaderTypes = Union[
 
 CookieTypes = Union["Cookies", CookieJar, Dict[str, str], List[Tuple[str, str]]]
 
+# A 5-tuple may also be used, including a 'total' budget as the final item.
 TimeoutTypes = Union[
     Optional[float],
     Tuple[Optional[float], Optional[float], Optional[float], Optional[float]],
+    Tuple[
+        Optional[float],
+        Optional[float],
+        Optional[float],
+        Optional[float],
+        Optional[float],
+    ],
     "Timeout",
 ]
 ProxyTypes = Union["URL", str, "Proxy"]

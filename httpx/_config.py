@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import typing
 
 from ._models import Headers
@@ -81,6 +82,29 @@ class Timeout:
     Timeout(5.0, connect=10.0)  # 10s timeout on connect. 5s timeout elsewhere.
     Timeout(5.0, pool=None)     # No timeout on acquiring connection from pool.
                                 # 5s timeout elsewhere.
+
+    A `total` budget may also be included, bounding the entire request,
+    including any redirects...
+
+    Timeout(None, total=30.0)                      # 30s total budget.
+    Timeout(None, connect=5.0, read=10.0,
+            write=None, total=30.0)                # 30s total budget, with
+                                                   # per-operation allowances.
+
+    The per-operation timeouts and the `total` budget compose using
+    'remaining time' semantics: each phase of a request may only consume
+    its own remaining allowance, given by `min(phase, total - elapsed)`.
+
+    The values `None`, 'unset', and `0` are distinct...
+
+    * `None` means 'no limit' for that phase.
+    * An unset phase inherits the default, if one was given.
+    * `0` means the phase must complete immediately, and will
+      raise a timeout if any time is spent on it.
+
+    Contradictory configurations, such as a negative value, or a
+    per-operation timeout that exceeds the `total` budget, are rejected
+    with a `ValueError`.
     """
 
     def __init__(
@@ -91,6 +115,7 @@ class Timeout:
         read: None | float | UnsetType = UNSET,
         write: None | float | UnsetType = UNSET,
         pool: None | float | UnsetType = UNSET,
+        total: None | float | UnsetType = UNSET,
     ) -> None:
         if isinstance(timeout, Timeout):
             # Passed as a single explicit Timeout.
@@ -98,16 +123,19 @@ class Timeout:
             assert read is UNSET
             assert write is UNSET
             assert pool is UNSET
+            assert total is UNSET
             self.connect = timeout.connect  # type: typing.Optional[float]
             self.read = timeout.read  # type: typing.Optional[float]
             self.write = timeout.write  # type: typing.Optional[float]
             self.pool = timeout.pool  # type: typing.Optional[float]
+            self.total = timeout.total  # type: typing.Optional[float]
         elif isinstance(timeout, tuple):
             # Passed as a tuple.
             self.connect = timeout[0]
             self.read = timeout[1]
             self.write = None if len(timeout) < 3 else timeout[2]
             self.pool = None if len(timeout) < 4 else timeout[3]
+            self.total = None if len(timeout) < 5 else timeout[4]
         elif not (
             isinstance(connect, UnsetType)
             or isinstance(read, UnsetType)
@@ -118,16 +146,43 @@ class Timeout:
             self.read = read
             self.write = write
             self.pool = pool
+            self.total = None if isinstance(total, UnsetType) else total
         else:
-            if isinstance(timeout, UnsetType):
+            if isinstance(timeout, UnsetType) and isinstance(total, UnsetType):
                 raise ValueError(
                     "httpx.Timeout must either include a default, or set all "
                     "four parameters explicitly."
                 )
-            self.connect = timeout if isinstance(connect, UnsetType) else connect
-            self.read = timeout if isinstance(read, UnsetType) else read
-            self.write = timeout if isinstance(write, UnsetType) else write
-            self.pool = timeout if isinstance(pool, UnsetType) else pool
+            default = None if isinstance(timeout, UnsetType) else timeout
+            self.connect = default if isinstance(connect, UnsetType) else connect
+            self.read = default if isinstance(read, UnsetType) else read
+            self.write = default if isinstance(write, UnsetType) else write
+            self.pool = default if isinstance(pool, UnsetType) else pool
+            self.total = None if isinstance(total, UnsetType) else total
+
+        self._validate()
+
+    def _validate(self) -> None:
+        phases = {
+            "connect": self.connect,
+            "read": self.read,
+            "write": self.write,
+            "pool": self.pool,
+            "total": self.total,
+        }
+        for name, value in phases.items():
+            if value is not None and value < 0:
+                raise ValueError(
+                    f"httpx.Timeout {name} must not be negative, but got {value}."
+                )
+        if self.total is not None:
+            for name in ("connect", "read", "write", "pool"):
+                value = phases[name]
+                if value is not None and value > self.total:
+                    raise ValueError(
+                        "httpx.Timeout is contradictory: "
+                        f"{name}={value} exceeds the total budget of {self.total}."
+                    )
 
     def as_dict(self) -> dict[str, float | None]:
         return {
@@ -137,6 +192,25 @@ class Timeout:
             "pool": self.pool,
         }
 
+    def clamped(self, elapsed: float) -> dict[str, float | None]:
+        """
+        Return the per-phase timeouts that apply once `elapsed` seconds
+        of the total budget have been consumed.
+
+        Each phase may only consume its own remaining allowance, given by
+        the smaller of its configured timeout and the remaining portion
+        of the total budget. Phases configured as `None` (no limit) are
+        still bounded by the remaining total budget.
+        """
+        phases = self.as_dict()
+        if self.total is None:
+            return phases
+        remaining = max(self.total - elapsed, 0.0)
+        return {
+            name: remaining if value is None else min(value, remaining)
+            for name, value in phases.items()
+        }
+
     def __eq__(self, other: typing.Any) -> bool:
         return (
             isinstance(other, self.__class__)
@@ -144,16 +218,78 @@ class Timeout:
             and self.read == other.read
             and self.write == other.write
             and self.pool == other.pool
+            and self.total == other.total
         )
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
+        total = "" if self.total is None else f", total={self.total}"
         if len({self.connect, self.read, self.write, self.pool}) == 1:
-            return f"{class_name}(timeout={self.connect})"
+            return f"{class_name}(timeout={self.connect}{total})"
         return (
             f"{class_name}(connect={self.connect}, "
-            f"read={self.read}, write={self.write}, pool={self.pool})"
+            f"read={self.read}, write={self.write}, pool={self.pool}{total})"
         )
+
+
+class TimeoutBudget:
+    """
+    Tracks consumption of a `Timeout(total=...)` budget across the phases
+    of a request, including any redirects that are followed.
+
+    A monotonic clock is used, so the budget is not affected by system
+    clock changes. The budget is started once, as the request first hits
+    the network, and is never reset by redirects: DNS, pool acquisition,
+    connecting, TLS, reads, writes, and any redirects each consume their
+    own remaining allowance of the one shared budget.
+
+    The budget is a pure calculation over the monotonic clock. It does
+    not register any timers or cancellation handlers, so there is nothing
+    to leak into the connection pool on cancellation, connection reuse,
+    or when a response stream is closed in the background.
+    """
+
+    def __init__(self, timeout: Timeout) -> None:
+        self._timeout = timeout
+        self._start: float | None = None
+
+    @property
+    def timeout(self) -> Timeout:
+        return self._timeout
+
+    def start(self) -> None:
+        # Called as a request is about to hit the network. Only the first
+        # call takes effect, so that every request in a redirect chain
+        # shares a single budget.
+        if self._start is None:
+            self._start = time.monotonic()
+
+    def reset(self) -> None:
+        self._start = None
+
+    @property
+    def started(self) -> bool:
+        return self._start is not None
+
+    @property
+    def elapsed(self) -> float:
+        if self._start is None:
+            return 0.0
+        return time.monotonic() - self._start
+
+    @property
+    def remaining(self) -> float | None:
+        if self._timeout.total is None:
+            return None
+        return max(self._timeout.total - self.elapsed, 0.0)
+
+    @property
+    def is_expired(self) -> bool:
+        remaining = self.remaining
+        return remaining is not None and remaining <= 0.0
+
+    def as_dict(self) -> dict[str, float | None]:
+        return self._timeout.clamped(self.elapsed)
 
 
 class Limits:

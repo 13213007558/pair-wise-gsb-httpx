@@ -18,10 +18,12 @@ from ._config import (
     Limits,
     Proxy,
     Timeout,
+    TimeoutBudget,
 )
 from ._decoders import SUPPORTED_DECODERS
 from ._exceptions import (
     InvalidURL,
+    ReadTimeout,
     RemoteProtocolError,
     TooManyRedirects,
     request_context,
@@ -143,15 +145,43 @@ class BoundSyncStream(SyncByteStream):
     """
 
     def __init__(
-        self, stream: SyncByteStream, response: Response, start: float
+        self,
+        stream: SyncByteStream,
+        response: Response,
+        start: float,
+        budget: TimeoutBudget | None = None,
     ) -> None:
         self._stream = stream
         self._response = response
         self._start = start
+        self._budget = budget
 
     def __iter__(self) -> typing.Iterator[bytes]:
-        for chunk in self._stream:
-            yield chunk
+        self._raise_if_budget_exhausted()
+        iterator = iter(self._stream)
+        try:
+            for chunk in iterator:
+                yield chunk
+                self._raise_if_budget_exhausted()
+        finally:
+            # Ensure the underlying iterator is deterministically closed,
+            # so that abandoning a response part-way through, such as on
+            # cancellation or an exhausted timeout budget, does not leave
+            # any resources or timeout handlers in place.
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+
+    def _raise_if_budget_exhausted(self) -> None:
+        # Reading the response body may only consume the remaining
+        # allowance of any 'total' timeout budget. Once the budget is
+        # exhausted further reads raise `ReadTimeout`, consistently
+        # for both sync and async clients, and for streaming and
+        # non-streaming responses.
+        if self._budget is not None and self._budget.is_expired:
+            raise ReadTimeout(
+                "The 'total' timeout budget for this request has been exhausted."
+            )
 
     def close(self) -> None:
         elapsed = time.perf_counter() - self._start
@@ -166,15 +196,38 @@ class BoundAsyncStream(AsyncByteStream):
     """
 
     def __init__(
-        self, stream: AsyncByteStream, response: Response, start: float
+        self,
+        stream: AsyncByteStream,
+        response: Response,
+        start: float,
+        budget: TimeoutBudget | None = None,
     ) -> None:
         self._stream = stream
         self._response = response
         self._start = start
+        self._budget = budget
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        async for chunk in self._stream:
-            yield chunk
+        self._raise_if_budget_exhausted()
+        iterator = self._stream.__aiter__()
+        try:
+            async for chunk in iterator:
+                yield chunk
+                self._raise_if_budget_exhausted()
+        finally:
+            # Ensure the underlying iterator is deterministically closed,
+            # so that abandoning a response part-way through, such as on
+            # cancellation or an exhausted timeout budget, does not leave
+            # any resources or timeout handlers in place.
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    def _raise_if_budget_exhausted(self) -> None:
+        if self._budget is not None and self._budget.is_expired:
+            raise ReadTimeout(
+                "The 'total' timeout budget for this request has been exhausted."
+            )
 
     async def aclose(self) -> None:
         elapsed = time.perf_counter() - self._start
@@ -374,7 +427,7 @@ class BaseClient:
                 if isinstance(timeout, UseClientDefault)
                 else Timeout(timeout)
             )
-            extensions = dict(**extensions, timeout=timeout.as_dict())
+            extensions = dict(**extensions, **self._timeout_extensions(timeout))
         return Request(
             method,
             url,
@@ -588,7 +641,30 @@ class BaseClient:
                 if isinstance(self.timeout, UseClientDefault)
                 else Timeout(self.timeout)
             )
-            request.extensions = dict(**request.extensions, timeout=timeout.as_dict())
+            request.extensions = dict(
+                **request.extensions, **self._timeout_extensions(timeout)
+            )
+
+    def _timeout_extensions(self, timeout: Timeout) -> dict[str, typing.Any]:
+        # Requests including a 'total' budget carry a `TimeoutBudget` in
+        # their extensions. The budget is shared by every request in a
+        # redirect chain, so that redirects consume the remaining
+        # allowance rather than resetting it.
+        extensions: dict[str, typing.Any] = {"timeout": timeout.as_dict()}
+        if timeout.total is not None:
+            extensions["timeout_budget"] = TimeoutBudget(timeout)
+        return extensions
+
+    def _clamp_request_timeout(self, request: Request) -> TimeoutBudget | None:
+        # Called as a request is about to hit the network. Each phase
+        # (DNS, pool, connect, TLS, read, write) may only consume its
+        # own remaining allowance of any 'total' budget.
+        budget = request.extensions.get("timeout_budget")
+        if not isinstance(budget, TimeoutBudget):
+            return None
+        budget.start()
+        request.extensions = {**request.extensions, "timeout": budget.as_dict()}
+        return budget
 
 
 class Client(BaseClient):
@@ -909,6 +985,12 @@ class Client(BaseClient):
 
         self._set_timeout(request)
 
+        budget = request.extensions.get("timeout_budget")
+        if isinstance(budget, TimeoutBudget):
+            # Each top-level send() starts a fresh 'total' budget.
+            # Redirects followed within the send share the budget.
+            budget.reset()
+
         auth = self._build_request_auth(request, auth)
 
         response = self._send_handling_auth(
@@ -1010,6 +1092,8 @@ class Client(BaseClient):
                 "Attempted to send an async request with a sync Client instance."
             )
 
+        budget = self._clamp_request_timeout(request)
+
         with request_context(request=request):
             response = transport.handle_request(request)
 
@@ -1017,7 +1101,7 @@ class Client(BaseClient):
 
         response.request = request
         response.stream = BoundSyncStream(
-            response.stream, response=response, start=start
+            response.stream, response=response, start=start, budget=budget
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
@@ -1624,6 +1708,12 @@ class AsyncClient(BaseClient):
 
         self._set_timeout(request)
 
+        budget = request.extensions.get("timeout_budget")
+        if isinstance(budget, TimeoutBudget):
+            # Each top-level send() starts a fresh 'total' budget.
+            # Redirects followed within the send share the budget.
+            budget.reset()
+
         auth = self._build_request_auth(request, auth)
 
         response = await self._send_handling_auth(
@@ -1726,13 +1816,15 @@ class AsyncClient(BaseClient):
                 "Attempted to send an sync request with an AsyncClient instance."
             )
 
+        budget = self._clamp_request_timeout(request)
+
         with request_context(request=request):
             response = await transport.handle_async_request(request)
 
         assert isinstance(response.stream, AsyncByteStream)
         response.request = request
         response.stream = BoundAsyncStream(
-            response.stream, response=response, start=start
+            response.stream, response=response, start=start, budget=budget
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding

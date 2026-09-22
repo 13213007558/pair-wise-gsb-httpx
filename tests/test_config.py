@@ -161,6 +161,119 @@ def test_timeout_repr():
     assert repr(timeout) == "Timeout(connect=None, read=5.0, write=None, pool=None)"
 
 
+def test_timeout_total_budget():
+    timeout = httpx.Timeout(None, connect=5.0, read=10.0, write=None, total=30.0)
+    assert timeout.connect == 5.0
+    assert timeout.read == 10.0
+    assert timeout.write is None
+    assert timeout.pool is None
+    assert timeout.total == 30.0
+
+
+def test_timeout_total_only():
+    # A 'total' budget may be used without any per-operation timeouts.
+    timeout = httpx.Timeout(total=30.0)
+    assert timeout.connect is None
+    assert timeout.read is None
+    assert timeout.write is None
+    assert timeout.pool is None
+    assert timeout.total == 30.0
+
+
+def test_timeout_total_defaults_to_none():
+    # Existing constructions are unchanged: no total budget unless given.
+    assert httpx.Timeout(5.0).total is None
+    assert httpx.Timeout(None).total is None
+    assert httpx.Timeout(connect=1.0, read=2.0, write=3.0, pool=4.0).total is None
+
+
+def test_timeout_total_from_tuple():
+    timeout = httpx.Timeout(timeout=(5.0, 10.0, None, None, 30.0))
+    assert timeout == httpx.Timeout(
+        None, connect=5.0, read=10.0, write=None, pool=None, total=30.0
+    )
+
+
+def test_timeout_total_from_config_instance():
+    timeout = httpx.Timeout(None, read=10.0, total=30.0)
+    assert httpx.Timeout(timeout) == timeout
+    assert httpx.Timeout(timeout).total == 30.0
+
+
+def test_timeout_none_unset_and_zero_are_distinct():
+    # 'None' disables a timeout, 'unset' inherits the default,
+    # and zero requires the phase to complete immediately.
+    timeout = httpx.Timeout(5.0, read=None)
+    assert timeout.read is None
+    timeout = httpx.Timeout(5.0)
+    assert timeout.read == 5.0
+    timeout = httpx.Timeout(5.0, read=0)
+    assert timeout.read == 0
+    assert httpx.Timeout(None, total=0).total == 0
+
+
+def test_timeout_negative_values_rejected():
+    with pytest.raises(ValueError):
+        httpx.Timeout(-1.0)
+    with pytest.raises(ValueError):
+        httpx.Timeout(None, read=-1.0)
+    with pytest.raises(ValueError):
+        httpx.Timeout(None, total=-1.0)
+
+
+def test_timeout_contradictory_total_rejected():
+    # A per-operation timeout that exceeds the total budget can never
+    # be used, so the combination is rejected at construction time.
+    with pytest.raises(ValueError):
+        httpx.Timeout(None, connect=60.0, total=30.0)
+    with pytest.raises(ValueError):
+        httpx.Timeout(None, read=60.0, total=30.0)
+    with pytest.raises(ValueError):
+        httpx.Timeout(None, write=60.0, total=30.0)
+    with pytest.raises(ValueError):
+        httpx.Timeout(None, pool=60.0, total=30.0)
+    with pytest.raises(ValueError):
+        httpx.Timeout(5.0, total=0)
+
+
+def test_timeout_total_repr():
+    timeout = httpx.Timeout(5.0, total=30.0)
+    assert repr(timeout) == "Timeout(timeout=5.0, total=30.0)"
+
+    timeout = httpx.Timeout(None, read=5.0, total=30.0)
+    assert repr(timeout) == (
+        "Timeout(connect=None, read=5.0, write=None, pool=None, total=30.0)"
+    )
+
+
+def test_timeout_clamped_remaining_time():
+    timeout = httpx.Timeout(None, connect=5.0, read=10.0, write=None, total=30.0)
+    # With no time elapsed the per-operation timeouts apply as configured.
+    assert timeout.clamped(0.0) == {
+        "connect": 5.0,
+        "read": 10.0,
+        "write": 30.0,
+        "pool": 30.0,
+    }
+    # Each phase only consumes its own remaining allowance.
+    assert timeout.clamped(12.0) == {
+        "connect": 5.0,
+        "read": 10.0,
+        "write": 18.0,
+        "pool": 18.0,
+    }
+    # An exhausted budget clamps every phase to zero.
+    assert timeout.clamped(35.0) == {
+        "connect": 0.0,
+        "read": 0.0,
+        "write": 0.0,
+        "pool": 0.0,
+    }
+    # Without a total budget no clamping applies.
+    timeout = httpx.Timeout(5.0)
+    assert timeout.clamped(100.0) == timeout.as_dict()
+
+
 def test_proxy_from_url():
     proxy = httpx.Proxy("https://example.com")
 

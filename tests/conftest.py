@@ -70,6 +70,8 @@ async def app(scope: Scope, receive: Receive, send: Send) -> None:
         await echo_headers(scope, receive, send)
     elif scope["path"].startswith("/redirect_301"):
         await redirect_301(scope, receive, send)
+    elif scope["path"].startswith("/redirect_to_slow"):
+        await redirect_to_slow(scope, receive, send)
     elif scope["path"].startswith("/json"):
         await hello_world_json(scope, receive, send)
     else:
@@ -178,6 +180,17 @@ async def echo_headers(scope: Scope, receive: Receive, send: Send) -> None:
 async def redirect_301(scope: Scope, receive: Receive, send: Send) -> None:
     await send(
         {"type": "http.response.start", "status": 301, "headers": [[b"location", b"/"]]}
+    )
+    await send({"type": "http.response.body"})
+
+
+async def redirect_to_slow(scope: Scope, receive: Receive, send: Send) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 301,
+            "headers": [[b"location", b"/slow_response"]],
+        }
     )
     await send({"type": "http.response.body"})
 
