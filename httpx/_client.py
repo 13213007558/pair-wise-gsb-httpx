@@ -28,6 +28,7 @@ from ._exceptions import (
 )
 from ._models import Cookies, Headers, Request, Response
 from ._status_codes import codes
+from ._timeouts import TimeoutBudget
 from ._transports.base import AsyncBaseTransport, BaseTransport
 from ._transports.default import AsyncHTTPTransport, HTTPTransport
 from ._types import (
@@ -589,6 +590,9 @@ class BaseClient:
                 else Timeout(self.timeout)
             )
             request.extensions = dict(**request.extensions, timeout=timeout.as_dict())
+        if "timeout_budget" not in request.extensions:
+            budget = TimeoutBudget(request.extensions["timeout"])
+            request.extensions = dict(**request.extensions, timeout_budget=budget)
 
 
 class Client(BaseClient):

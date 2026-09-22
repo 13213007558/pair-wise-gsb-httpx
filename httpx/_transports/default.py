@@ -53,6 +53,13 @@ from .._exceptions import (
     WriteTimeout,
 )
 from .._models import Request, Response
+from .._timeouts import (
+    BudgetAsyncBackend,
+    BudgetSyncBackend,
+    TimeoutBudget,
+    TimeoutValues,
+    budget_context,
+)
 from .._types import AsyncByteStream, CertTypes, ProxyTypes, SyncByteStream
 from .._urls import URL
 from .base import AsyncBaseTransport, BaseTransport
@@ -119,11 +126,16 @@ def map_httpcore_exceptions() -> typing.Iterator[None]:
 
 
 class ResponseStream(SyncByteStream):
-    def __init__(self, httpcore_stream: typing.Iterable[bytes]) -> None:
+    def __init__(
+        self,
+        httpcore_stream: typing.Iterable[bytes],
+        budget: TimeoutBudget | None,
+    ) -> None:
         self._httpcore_stream = httpcore_stream
+        self._budget = budget
 
     def __iter__(self) -> typing.Iterator[bytes]:
-        with map_httpcore_exceptions():
+        with map_httpcore_exceptions(), budget_context(self._budget):
             for part in self._httpcore_stream:
                 yield part
 
@@ -164,6 +176,7 @@ class HTTPTransport(BaseTransport):
                 local_address=local_address,
                 retries=retries,
                 socket_options=socket_options,
+                network_backend=BudgetSyncBackend(),
             )
         elif proxy.url.scheme in ("http", "https"):
             self._pool = httpcore.HTTPProxy(
@@ -183,6 +196,7 @@ class HTTPTransport(BaseTransport):
                 http1=http1,
                 http2=http2,
                 socket_options=socket_options,
+                network_backend=BudgetSyncBackend(),
             )
         elif proxy.url.scheme in ("socks5", "socks5h"):
             try:
@@ -207,6 +221,7 @@ class HTTPTransport(BaseTransport):
                 keepalive_expiry=limits.keepalive_expiry,
                 http1=http1,
                 http2=http2,
+                network_backend=BudgetSyncBackend(),
             )
         else:  # pragma: no cover
             raise ValueError(
@@ -232,7 +247,31 @@ class HTTPTransport(BaseTransport):
         request: Request,
     ) -> Response:
         assert isinstance(request.stream, SyncByteStream)
+
+        req, budget = self._build_httpcore_request(request)
+        with map_httpcore_exceptions(), budget_context(budget):
+            resp = self._pool.handle_request(req)
+
+        assert isinstance(resp.stream, typing.Iterable)
+
+        return Response(
+            status_code=resp.status,
+            headers=resp.headers,
+            stream=ResponseStream(resp.stream, budget),
+            extensions=resp.extensions,
+        )
+
+    def _build_httpcore_request(
+        self, request: Request
+    ) -> tuple[typing.Any, TimeoutBudget | None]:
         import httpcore
+
+        extensions = dict(request.extensions)
+        budget = extensions.pop("timeout_budget", None)
+        if not isinstance(budget, TimeoutBudget) and "timeout" in extensions:
+            budget = TimeoutBudget(extensions["timeout"])
+        if budget is not None:
+            extensions["timeout"] = TimeoutValues(budget)
 
         req = httpcore.Request(
             method=request.method,
@@ -244,30 +283,25 @@ class HTTPTransport(BaseTransport):
             ),
             headers=request.headers.raw,
             content=request.stream,
-            extensions=request.extensions,
+            extensions=extensions,
         )
-        with map_httpcore_exceptions():
-            resp = self._pool.handle_request(req)
-
-        assert isinstance(resp.stream, typing.Iterable)
-
-        return Response(
-            status_code=resp.status,
-            headers=resp.headers,
-            stream=ResponseStream(resp.stream),
-            extensions=resp.extensions,
-        )
+        return req, budget
 
     def close(self) -> None:
         self._pool.close()
 
 
 class AsyncResponseStream(AsyncByteStream):
-    def __init__(self, httpcore_stream: typing.AsyncIterable[bytes]) -> None:
+    def __init__(
+        self,
+        httpcore_stream: typing.AsyncIterable[bytes],
+        budget: TimeoutBudget | None,
+    ) -> None:
         self._httpcore_stream = httpcore_stream
+        self._budget = budget
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        with map_httpcore_exceptions():
+        with map_httpcore_exceptions(), budget_context(self._budget):
             async for part in self._httpcore_stream:
                 yield part
 
@@ -308,6 +342,7 @@ class AsyncHTTPTransport(AsyncBaseTransport):
                 local_address=local_address,
                 retries=retries,
                 socket_options=socket_options,
+                network_backend=BudgetAsyncBackend(),
             )
         elif proxy.url.scheme in ("http", "https"):
             self._pool = httpcore.AsyncHTTPProxy(
@@ -327,6 +362,7 @@ class AsyncHTTPTransport(AsyncBaseTransport):
                 http1=http1,
                 http2=http2,
                 socket_options=socket_options,
+                network_backend=BudgetAsyncBackend(),
             )
         elif proxy.url.scheme in ("socks5", "socks5h"):
             try:
@@ -351,6 +387,7 @@ class AsyncHTTPTransport(AsyncBaseTransport):
                 keepalive_expiry=limits.keepalive_expiry,
                 http1=http1,
                 http2=http2,
+                network_backend=BudgetAsyncBackend(),
             )
         else:  # pragma: no cover
             raise ValueError(
@@ -376,7 +413,31 @@ class AsyncHTTPTransport(AsyncBaseTransport):
         request: Request,
     ) -> Response:
         assert isinstance(request.stream, AsyncByteStream)
+
+        req, budget = self._build_httpcore_request(request)
+        with map_httpcore_exceptions(), budget_context(budget):
+            resp = await self._pool.handle_async_request(req)
+
+        assert isinstance(resp.stream, typing.AsyncIterable)
+
+        return Response(
+            status_code=resp.status,
+            headers=resp.headers,
+            stream=AsyncResponseStream(resp.stream, budget),
+            extensions=resp.extensions,
+        )
+
+    def _build_httpcore_request(
+        self, request: Request
+    ) -> tuple[typing.Any, TimeoutBudget | None]:
         import httpcore
+
+        extensions = dict(request.extensions)
+        budget = extensions.pop("timeout_budget", None)
+        if not isinstance(budget, TimeoutBudget) and "timeout" in extensions:
+            budget = TimeoutBudget(extensions["timeout"])
+        if budget is not None:
+            extensions["timeout"] = TimeoutValues(budget)
 
         req = httpcore.Request(
             method=request.method,
@@ -388,19 +449,9 @@ class AsyncHTTPTransport(AsyncBaseTransport):
             ),
             headers=request.headers.raw,
             content=request.stream,
-            extensions=request.extensions,
+            extensions=extensions,
         )
-        with map_httpcore_exceptions():
-            resp = await self._pool.handle_async_request(req)
-
-        assert isinstance(resp.stream, typing.AsyncIterable)
-
-        return Response(
-            status_code=resp.status,
-            headers=resp.headers,
-            stream=AsyncResponseStream(resp.stream),
-            extensions=resp.extensions,
-        )
+        return req, budget
 
     async def aclose(self) -> None:
         await self._pool.aclose()

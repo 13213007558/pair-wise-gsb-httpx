@@ -106,12 +106,26 @@ def test_timeout_eq():
 
 
 def test_timeout_all_parameters_set():
-    timeout = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
-    assert timeout == httpx.Timeout(timeout=5.0)
+    timeout = httpx.Timeout(
+        total=5.0, dns=5.0, connect=5.0, read=5.0, write=5.0, pool=5.0
+    )
+    assert timeout == httpx.Timeout(total=5.0)
+
+
+def test_simple_timeout_has_no_total_budget():
+    timeout = httpx.Timeout(timeout=5.0)
+    assert timeout.total is None
+    assert timeout.dns == 5.0
+    assert timeout.connect == 5.0
+    assert timeout.read == 5.0
+    assert timeout.write == 5.0
+    assert timeout.pool == 5.0
 
 
 def test_timeout_from_nothing():
     timeout = httpx.Timeout(None)
+    assert timeout.total is None
+    assert timeout.dns is None
     assert timeout.connect is None
     assert timeout.read is None
     assert timeout.write is None
@@ -130,7 +144,11 @@ def test_timeout_from_one_none_value():
 
 def test_timeout_from_one_value():
     timeout = httpx.Timeout(None, read=5.0)
-    assert timeout == httpx.Timeout(timeout=(None, 5.0, None, None))
+    assert timeout.dns is None
+    assert timeout.connect is None
+    assert timeout.read == 5.0
+    assert timeout.write is None
+    assert timeout.pool is None
 
 
 def test_timeout_from_one_value_and_default():
@@ -148,6 +166,68 @@ def test_timeout_from_tuple():
     assert timeout == httpx.Timeout(timeout=5.0)
 
 
+def test_total_timeout_sets_each_operation():
+    timeout = httpx.Timeout(total=30.0, dns=2.0)
+    assert timeout.total == 30.0
+    assert timeout.dns == 2.0
+    assert timeout.connect == 30.0
+    assert timeout.read == 30.0
+    assert timeout.write == 30.0
+    assert timeout.pool == 30.0
+
+
+def test_client_requested_budget_configuration():
+    timeout = httpx.Timeout(
+        total=30.0,
+        dns=2.0,
+        connect=5.0,
+        read=10.0,
+        write=None,
+        pool=5.0,
+    )
+
+    assert timeout.as_dict() == {
+        "total": 30.0,
+        "dns": 2.0,
+        "connect": 5.0,
+        "read": 10.0,
+        "write": None,
+        "pool": 5.0,
+    }
+
+
+def test_explicit_none_and_zero_remain_distinct():
+    timeout = httpx.Timeout(total=30.0, write=None, read=0.0)
+    assert timeout.write is None
+    assert timeout.read == 0.0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"total": 30.0, "connect": 31.0},
+        {"total": 30.0, "read": 31.0},
+        {"total": 30.0, "write": 31.0},
+        {"total": 30.0, "pool": 31.0},
+        {"total": 30.0, "connect": 5.0, "dns": 6.0},
+    ],
+)
+def test_timeout_rejects_contradictory_budgets(kwargs):
+    with pytest.raises(ValueError):
+        httpx.Timeout(**kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [{"total": -1.0}, {"total": float("inf")}])
+def test_timeout_rejects_invalid_budget(kwargs):
+    with pytest.raises(ValueError):
+        httpx.Timeout(**kwargs)
+
+
+def test_timeout_rejects_non_numeric_budget():
+    with pytest.raises(TypeError):
+        httpx.Timeout(total="30")  # type: ignore[arg-type]
+
+
 def test_timeout_from_config_instance():
     timeout = httpx.Timeout(timeout=5.0)
     assert httpx.Timeout(timeout) == httpx.Timeout(timeout=5.0)
@@ -158,7 +238,10 @@ def test_timeout_repr():
     assert repr(timeout) == "Timeout(timeout=5.0)"
 
     timeout = httpx.Timeout(None, read=5.0)
-    assert repr(timeout) == "Timeout(connect=None, read=5.0, write=None, pool=None)"
+    assert repr(timeout) == (
+        "Timeout(total=None, dns=None, connect=None, read=5.0, "
+        "write=None, pool=None)"
+    )
 
 
 def test_proxy_from_url():

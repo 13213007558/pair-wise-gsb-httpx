@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import typing
 
@@ -18,6 +19,12 @@ class UnsetType:
 
 
 UNSET = UnsetType()
+
+
+def _timeout_or_default(
+    value: None | float | UnsetType, default: None | float
+) -> None | float:
+    return default if isinstance(value, UnsetType) else value
 
 
 def create_ssl_context(
@@ -75,18 +82,26 @@ class Timeout:
 
     **Usage**:
 
-    Timeout(None)               # No timeouts.
-    Timeout(5.0)                # 5s timeout on all operations.
-    Timeout(None, connect=5.0)  # 5s timeout on connect, no other timeouts.
-    Timeout(5.0, connect=10.0)  # 10s timeout on connect. 5s timeout elsewhere.
-    Timeout(5.0, pool=None)     # No timeout on acquiring connection from pool.
-                                # 5s timeout elsewhere.
+    Timeout(5.0)                  # 5s timeout on each operation.
+    Timeout(None)                 # No timeouts.
+    Timeout(total=30.0)           # 30s total and per-operation budget.
+    Timeout(None, total=30.0)     # 30s total budget; operations are uncapped.
+    Timeout(total=30, dns=2)      # DNS has its own smaller connect sub-budget.
     """
+
+    total: float | None
+    dns: float | None
+    connect: float | None
+    read: float | None
+    write: float | None
+    pool: float | None
 
     def __init__(
         self,
         timeout: TimeoutTypes | UnsetType = UNSET,
         *,
+        total: None | float | UnsetType = UNSET,
+        dns: None | float | UnsetType = UNSET,
         connect: None | float | UnsetType = UNSET,
         read: None | float | UnsetType = UNSET,
         write: None | float | UnsetType = UNSET,
@@ -94,10 +109,14 @@ class Timeout:
     ) -> None:
         if isinstance(timeout, Timeout):
             # Passed as a single explicit Timeout.
+            assert total is UNSET
+            assert dns is UNSET
             assert connect is UNSET
             assert read is UNSET
             assert write is UNSET
             assert pool is UNSET
+            self.total = timeout.total
+            self.dns = timeout.dns
             self.connect = timeout.connect  # type: typing.Optional[float]
             self.read = timeout.read  # type: typing.Optional[float]
             self.write = timeout.write  # type: typing.Optional[float]
@@ -108,29 +127,75 @@ class Timeout:
             self.read = timeout[1]
             self.write = None if len(timeout) < 3 else timeout[2]
             self.pool = None if len(timeout) < 4 else timeout[3]
-        elif not (
-            isinstance(connect, UnsetType)
-            or isinstance(read, UnsetType)
-            or isinstance(write, UnsetType)
-            or isinstance(pool, UnsetType)
-        ):
-            self.connect = connect
-            self.read = read
-            self.write = write
-            self.pool = pool
+            self.dns = self.connect if isinstance(dns, UnsetType) else dns
+            self.total = None if isinstance(total, UnsetType) else total
+            self._validate()
         else:
-            if isinstance(timeout, UnsetType):
+            operations = (connect, read, write, pool)
+            all_operations_set = not any(
+                isinstance(value, UnsetType) for value in operations
+            )
+            if (
+                isinstance(timeout, UnsetType)
+                and isinstance(total, UnsetType)
+                and not all_operations_set
+            ):
                 raise ValueError(
                     "httpx.Timeout must either include a default, or set all "
                     "four parameters explicitly."
                 )
-            self.connect = timeout if isinstance(connect, UnsetType) else connect
-            self.read = timeout if isinstance(read, UnsetType) else read
-            self.write = timeout if isinstance(write, UnsetType) else write
-            self.pool = timeout if isinstance(pool, UnsetType) else pool
+
+            default = typing.cast(
+                None | float, total if isinstance(timeout, UnsetType) else timeout
+            )
+            self.total = None if isinstance(total, UnsetType) else total
+            self.connect = _timeout_or_default(connect, default)
+            self.read = _timeout_or_default(read, default)
+            self.write = _timeout_or_default(write, default)
+            self.pool = _timeout_or_default(pool, default)
+            self.dns = _timeout_or_default(dns, self.connect)
+            self._validate()
+
+    @staticmethod
+    def _valid_timeout_value(value: None | float, name: str) -> None:
+        if value is None:
+            return
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"Timeout {name} must be a number or None.")
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"Timeout {name} must be a finite, non-negative value.")
+
+    def _validate(self) -> None:
+        values = {
+            "total": self.total,
+            "dns": self.dns,
+            "connect": self.connect,
+            "read": self.read,
+            "write": self.write,
+            "pool": self.pool,
+        }
+        for name, value in values.items():
+            self._valid_timeout_value(value, name)
+
+        if self.total is not None:
+            for name in ("connect", "read", "write", "pool"):
+                value = getattr(self, name)
+                if value is not None and value > self.total:
+                    raise ValueError(
+                        f"Timeout {name} cannot exceed the total request timeout."
+                    )
+
+        if (
+            self.dns is not None
+            and self.connect is not None
+            and self.dns > self.connect
+        ):
+            raise ValueError("Timeout dns cannot exceed the connect timeout.")
 
     def as_dict(self) -> dict[str, float | None]:
         return {
+            "total": self.total,
+            "dns": self.dns,
             "connect": self.connect,
             "read": self.read,
             "write": self.write,
@@ -140,6 +205,8 @@ class Timeout:
     def __eq__(self, other: typing.Any) -> bool:
         return (
             isinstance(other, self.__class__)
+            and self.total == other.total
+            and self.dns == other.dns
             and self.connect == other.connect
             and self.read == other.read
             and self.write == other.write
@@ -148,11 +215,19 @@ class Timeout:
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
-        if len({self.connect, self.read, self.write, self.pool}) == 1:
+        operation_values = {self.connect, self.read, self.write, self.pool}
+        if (
+            self.total is None
+            and self.dns == self.connect
+            and len(operation_values) == 1
+        ):
             return f"{class_name}(timeout={self.connect})"
+        if len(operation_values | {self.total, self.dns}) == 1:
+            return f"{class_name}(total={self.total})"
         return (
-            f"{class_name}(connect={self.connect}, "
-            f"read={self.read}, write={self.write}, pool={self.pool})"
+            f"{class_name}(total={self.total}, dns={self.dns}, "
+            f"connect={self.connect}, read={self.read}, "
+            f"write={self.write}, pool={self.pool})"
         )
 
 

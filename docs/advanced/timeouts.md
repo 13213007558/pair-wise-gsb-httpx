@@ -1,7 +1,9 @@
 HTTPX is careful to enforce timeouts everywhere by default.
 
 The default behavior is to raise a `TimeoutException` after 5 seconds of
-network inactivity.
+network inactivity. Simple numeric timeouts apply independently to each
+network operation. The `total` timeout additionally bounds the complete
+request budget.
 
 ## Setting and disabling timeouts
 
@@ -42,12 +44,19 @@ client = httpx.Client(timeout=None)  # Disable all timeouts by default.
 
 HTTPX also allows you to specify the timeout behavior in more fine grained detail.
 
-There are four different types of timeouts that may occur. These are **connect**,
-**read**, **write**, and **pool** timeouts.
+There are six different timeout budgets. These are **total**, **dns**,
+**connect**, **read**, **write**, and **pool** timeouts.
+
+* The **total** timeout is the absolute request deadline, measured using a
+monotonic clock. Redirects, authentication retries, pool waits, TLS, and response
+stream reads all consume the same remaining total budget.
+* The **dns** timeout bounds hostname resolution. It is capped by the remaining
+**connect** and **total** budgets.
 
 * The **connect** timeout specifies the maximum amount of time to wait until
-a socket connection to the requested host is established. If HTTPX is unable to connect
-within this time frame, a `ConnectTimeout` exception is raised.
+a socket connection to the requested host is established, including DNS, TCP,
+and TLS. If HTTPX is unable to connect within this time frame, a
+`ConnectTimeout` exception is raised.
 * The **read** timeout specifies the maximum duration to wait for a chunk of
 data to be received (for example, a chunk of the response body). If HTTPX is
 unable to receive data within this time frame, a `ReadTimeout` exception is raised.
@@ -68,4 +77,36 @@ timeout = httpx.Timeout(10.0, connect=60.0)
 client = httpx.Client(timeout=timeout)
 
 response = client.get('http://example.com/')
+```
+
+To set an overall request deadline while retaining per-operation limits:
+
+```python
+timeout = httpx.Timeout(
+    total=30.0,
+    dns=2.0,
+    connect=5.0,
+    read=10.0,
+    write=None,
+    pool=5.0,
+)
+client = httpx.Client(timeout=timeout)
+```
+
+`None` explicitly disables a timeout, `0` means time out immediately, and
+omitting a value lets it inherit the configured default. A sub-budget cannot be
+larger than its parent: `dns` cannot exceed `connect`, and operation budgets
+cannot exceed `total`.
+
+## Request budget timeline
+
+Each phase receives the smaller of its own remaining budget and the remaining
+total deadline. The total clock starts once the request begins and is not reset
+for redirects.
+
+```text
+total deadline: |=========================== 30s ===========================>|
+redirect 1:    |pool|dns|TCP/TLS|write|read headers|
+redirect 2:                  |pool|dns|TCP/TLS|write|read stream chunks ...|
+phase limits:    5   2    5     none  10 per chunk
 ```
