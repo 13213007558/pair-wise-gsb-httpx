@@ -9,6 +9,7 @@ import typing
 import urllib.request
 from collections.abc import Mapping
 from http.cookiejar import Cookie, CookieJar
+from typing import TYPE_CHECKING
 
 from ._content import ByteStream, UnattachedStream, encode_request, encode_response
 from ._decoders import (
@@ -47,6 +48,9 @@ from ._types import (
 )
 from ._urls import URL
 from ._utils import to_bytes_or_str, to_str
+
+if TYPE_CHECKING:
+    from ._proxy import ProxyRoute
 
 __all__ = ["Cookies", "Headers", "Request", "Response"]
 
@@ -536,6 +540,8 @@ class Response:
         # When follow_redirects=False and a redirect is received,
         # the client will set `response.next_request`.
         self.next_request: Request | None = None
+
+        self.proxy_route: ProxyRoute | None = None
 
         self.extensions = {} if extensions is None else dict(extensions)
         self.history = [] if history is None else list(history)

@@ -27,6 +27,7 @@ from ._exceptions import (
     request_context,
 )
 from ._models import Cookies, Headers, Request, Response
+from ._proxy import ProxyRoute, ProxyRoutingPolicy
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
 from ._transports.default import AsyncHTTPTransport, HTTPTransport
@@ -46,7 +47,7 @@ from ._types import (
     TimeoutTypes,
 )
 from ._urls import URL, QueryParams
-from ._utils import URLPattern, get_environment_proxies
+from ._utils import URLPattern
 
 if typing.TYPE_CHECKING:
     import ssl  # pragma: no cover
@@ -236,20 +237,6 @@ class BaseClient:
             return url
         return url.copy_with(raw_path=url.raw_path + b"/")
 
-    def _get_proxy_map(
-        self, proxy: ProxyTypes | None, allow_env_proxies: bool
-    ) -> dict[str, Proxy | None]:
-        if proxy is None:
-            if allow_env_proxies:
-                return {
-                    key: None if url is None else Proxy(url=url)
-                    for key, url in get_environment_proxies().items()
-                }
-            return {}
-        else:
-            proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
-            return {"all://": proxy}
-
     @property
     def timeout(self) -> Timeout:
         return self._timeout
@@ -337,6 +324,32 @@ class BaseClient:
     def params(self, params: QueryParamTypes) -> None:
         self._params = QueryParams(params)
 
+    @staticmethod
+    def _build_proxy_policy(
+        proxy: ProxyTypes | None,
+        proxies: typing.Mapping[str, ProxyTypes | None] | None,
+        no_proxy: str | typing.Sequence[str] | None,
+        proxy_policy: ProxyRoutingPolicy | None,
+        trust_env: bool,
+    ) -> ProxyRoutingPolicy:
+        if proxy_policy is not None:
+            if proxy is not None or proxies is not None or no_proxy is not None:
+                raise ValueError(
+                    "proxy_policy cannot be combined with proxy, proxies, or no_proxy."
+                )
+            return proxy_policy
+
+        environment = ProxyRoutingPolicy.from_environment() if trust_env else None
+        if proxy is not None:
+            if proxies is not None:
+                raise ValueError("proxy and proxies cannot be used together.")
+            explicit = ProxyRoutingPolicy({"all://": proxy}, no_proxy=no_proxy)
+            return explicit
+        if proxies is not None or no_proxy is not None:
+            explicit = ProxyRoutingPolicy(proxies, no_proxy=no_proxy)
+            return explicit.merged(environment)
+        return environment or ProxyRoutingPolicy()
+
     def build_request(
         self,
         method: str,
@@ -350,6 +363,7 @@ class BaseClient:
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Request:
         """
@@ -368,6 +382,8 @@ class BaseClient:
         cookies = self._merge_cookies(cookies)
         params = self._merge_queryparams(params)
         extensions = {} if extensions is None else extensions
+        if proxy is not None:
+            extensions["proxy"] = proxy
         if "timeout" not in extensions:
             timeout = (
                 self.timeout
@@ -482,13 +498,19 @@ class BaseClient:
         headers = self._redirect_headers(request, url, method)
         stream = self._redirect_stream(request, method)
         cookies = Cookies(self.cookies)
+        extensions = {
+            key: value
+            for key, value in request.extensions.items()
+            if key not in ("proxy", "previous_url")
+        }
+        extensions["previous_url"] = str(request.url)
         return Request(
             method=method,
             url=url,
             headers=headers,
             cookies=cookies,
             stream=stream,
-            extensions=request.extensions,
+            extensions=extensions,
         )
 
     def _redirect_method(self, request: Request, response: Response) -> str:
@@ -649,6 +671,9 @@ class Client(BaseClient):
         http1: bool = True,
         http2: bool = False,
         proxy: ProxyTypes | None = None,
+        proxies: typing.Mapping[str, ProxyTypes | None] | None = None,
+        no_proxy: str | typing.Sequence[str] | None = None,
+        proxy_policy: ProxyRoutingPolicy | None = None,
         mounts: None | (typing.Mapping[str, BaseTransport | None]) = None,
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
         follow_redirects: bool = False,
@@ -682,38 +707,32 @@ class Client(BaseClient):
                     "Make sure to install httpx using `pip install httpx[http2]`."
                 ) from None
 
-        allow_env_proxies = trust_env and transport is None
-        proxy_map = self._get_proxy_map(proxy, allow_env_proxies)
-
-        self._transport = self._init_transport(
-            verify=verify,
-            cert=cert,
-            trust_env=trust_env,
-            http1=http1,
-            http2=http2,
-            limits=limits,
-            transport=transport,
+        self._proxy_policy = self._build_proxy_policy(
+            proxy=proxy,
+            proxies=proxies,
+            no_proxy=no_proxy,
+            proxy_policy=proxy_policy,
+            trust_env=trust_env and transport is None,
         )
-        self._mounts: dict[URLPattern, BaseTransport | None] = {
-            URLPattern(key): None
-            if proxy is None
-            else self._init_proxy_transport(
-                proxy,
-                verify=verify,
-                cert=cert,
-                trust_env=trust_env,
-                http1=http1,
-                http2=http2,
-                limits=limits,
-            )
-            for key, proxy in proxy_map.items()
+
+        transport_kwargs = {
+            "verify": verify,
+            "cert": cert,
+            "trust_env": trust_env,
+            "http1": http1,
+            "http2": http2,
+            "limits": limits,
         }
+        self._proxy_transport_kwargs = transport_kwargs
+        self._transport = self._init_transport(transport=transport, **transport_kwargs)
+        self._mounts: dict[URLPattern, BaseTransport | None] = {}
         if mounts is not None:
             self._mounts.update(
                 {URLPattern(key): transport for key, transport in mounts.items()}
             )
 
         self._mounts = dict(sorted(self._mounts.items()))
+        self._proxy_transports: dict[Proxy, BaseTransport] = {}
 
     def _init_transport(
         self,
@@ -757,16 +776,46 @@ class Client(BaseClient):
             proxy=proxy,
         )
 
-    def _transport_for_url(self, url: URL) -> BaseTransport:
-        """
-        Returns the transport instance that should be used for a given URL.
-        This will either be the standard connection pool, or a proxy.
-        """
-        for pattern, transport in self._mounts.items():
-            if pattern.matches(url):
-                return self._transport if transport is None else transport
+    def proxy_route(self, request: Request) -> ProxyRoute:
+        previous_url = request.extensions.get("previous_url")
+        return self._proxy_policy.route_for_url(
+            request.url,
+            proxy=request.extensions.get("proxy"),
+            redirected_from=previous_url,
+        )
 
+    def _transport_for_request(self, request: Request) -> BaseTransport:
+        route = self.proxy_route(request)
+        if route.is_rejected:
+            raise ValueError(route.reason)
+
+        for pattern, transport in self._mounts.items():
+            if pattern.matches(request.url):
+                selected = self._transport if transport is None else transport
+                if route.is_proxy:
+                    raise ValueError(
+                        f"Per-request proxy {route.proxy.url} cannot override the "
+                        f"explicit mount {pattern.pattern!r}."
+                    )
+                return selected
+
+        if route.is_proxy:
+            assert route.proxy is not None
+            if type(self._transport).__name__ in ("ASGITransport", "WSGITransport"):
+                raise ValueError(
+                    "ASGI and WSGI transports cannot be used with an HTTP proxy."
+                )
+            if route.proxy not in self._proxy_transports:
+                self._proxy_transports[route.proxy] = self._init_proxy_transport(
+                    route.proxy,
+                    **self._proxy_transport_kwargs,
+                )
+            return self._proxy_transports[route.proxy]
         return self._transport
+
+    def _transport_for_url(self, url: URL) -> BaseTransport:
+        request = Request("GET", url)
+        return self._transport_for_request(request)
 
     def request(
         self,
@@ -783,6 +832,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -820,9 +870,15 @@ class Client(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
-        return self.send(request, auth=auth, follow_redirects=follow_redirects)
+        return self.send(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            proxy=proxy,
+        )
 
     @contextmanager
     def stream(
@@ -840,6 +896,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> typing.Iterator[Response]:
         """
@@ -863,6 +920,7 @@ class Client(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
         response = self.send(
@@ -883,6 +941,7 @@ class Client(BaseClient):
         stream: bool = False,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
     ) -> Response:
         """
         Send a request.
@@ -908,6 +967,8 @@ class Client(BaseClient):
         )
 
         self._set_timeout(request)
+        if proxy is not None:
+            request.extensions["proxy"] = proxy
 
         auth = self._build_request_auth(request, auth)
 
@@ -1002,7 +1063,8 @@ class Client(BaseClient):
         """
         Sends a single request, without handling any redirections.
         """
-        transport = self._transport_for_url(request.url)
+        route = self.proxy_route(request)
+        transport = self._transport_for_request(request)
         start = time.perf_counter()
 
         if not isinstance(request.stream, SyncByteStream):
@@ -1010,12 +1072,22 @@ class Client(BaseClient):
                 "Attempted to send an async request with a sync Client instance."
             )
 
-        with request_context(request=request):
-            response = transport.handle_request(request)
+        extensions = request.extensions
+        request.extensions = {
+            key: value
+            for key, value in extensions.items()
+            if key not in ("proxy", "previous_url")
+        }
+        try:
+            with request_context(request=request):
+                response = transport.handle_request(request)
+        finally:
+            request.extensions = extensions
 
         assert isinstance(response.stream, SyncByteStream)
 
         response.request = request
+        response.proxy_route = route
         response.stream = BoundSyncStream(
             response.stream, response=response, start=start
         )
@@ -1030,6 +1102,8 @@ class Client(BaseClient):
             response.status_code,
             response.reason_phrase,
         )
+        for reason in route.reasons:
+            logger.debug("%s", reason)
 
         return response
 
@@ -1043,6 +1117,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1059,6 +1134,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1072,6 +1148,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1088,6 +1165,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1101,6 +1179,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1117,6 +1196,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1134,6 +1214,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1154,6 +1235,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1171,6 +1253,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1191,6 +1274,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1208,6 +1292,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1228,6 +1313,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1241,6 +1327,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1257,6 +1344,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1269,8 +1357,10 @@ class Client(BaseClient):
 
             self._transport.close()
             for transport in self._mounts.values():
-                if transport is not None:
+                if transport is not None and transport is not self._transport:
                     transport.close()
+            for transport in self._proxy_transports.values():
+                transport.close()
 
     def __enter__(self: T) -> T:
         if self._state != ClientState.UNOPENED:
@@ -1286,8 +1376,10 @@ class Client(BaseClient):
 
         self._transport.__enter__()
         for transport in self._mounts.values():
-            if transport is not None:
+            if transport is not None and transport is not self._transport:
                 transport.__enter__()
+        for transport in self._proxy_transports.values():
+            transport.__enter__()
         return self
 
     def __exit__(
@@ -1300,8 +1392,10 @@ class Client(BaseClient):
 
         self._transport.__exit__(exc_type, exc_value, traceback)
         for transport in self._mounts.values():
-            if transport is not None:
+            if transport is not None and transport is not self._transport:
                 transport.__exit__(exc_type, exc_value, traceback)
+        for transport in self._proxy_transports.values():
+            transport.__exit__(exc_type, exc_value, traceback)
 
 
 class AsyncClient(BaseClient):
@@ -1362,6 +1456,9 @@ class AsyncClient(BaseClient):
         http1: bool = True,
         http2: bool = False,
         proxy: ProxyTypes | None = None,
+        proxies: typing.Mapping[str, ProxyTypes | None] | None = None,
+        no_proxy: str | typing.Sequence[str] | None = None,
+        proxy_policy: ProxyRoutingPolicy | None = None,
         mounts: None | (typing.Mapping[str, AsyncBaseTransport | None]) = None,
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
         follow_redirects: bool = False,
@@ -1396,38 +1493,32 @@ class AsyncClient(BaseClient):
                     "Make sure to install httpx using `pip install httpx[http2]`."
                 ) from None
 
-        allow_env_proxies = trust_env and transport is None
-        proxy_map = self._get_proxy_map(proxy, allow_env_proxies)
-
-        self._transport = self._init_transport(
-            verify=verify,
-            cert=cert,
-            trust_env=trust_env,
-            http1=http1,
-            http2=http2,
-            limits=limits,
-            transport=transport,
+        self._proxy_policy = self._build_proxy_policy(
+            proxy=proxy,
+            proxies=proxies,
+            no_proxy=no_proxy,
+            proxy_policy=proxy_policy,
+            trust_env=trust_env and transport is None,
         )
 
-        self._mounts: dict[URLPattern, AsyncBaseTransport | None] = {
-            URLPattern(key): None
-            if proxy is None
-            else self._init_proxy_transport(
-                proxy,
-                verify=verify,
-                cert=cert,
-                trust_env=trust_env,
-                http1=http1,
-                http2=http2,
-                limits=limits,
-            )
-            for key, proxy in proxy_map.items()
+        transport_kwargs = {
+            "verify": verify,
+            "cert": cert,
+            "trust_env": trust_env,
+            "http1": http1,
+            "http2": http2,
+            "limits": limits,
         }
+        self._proxy_transport_kwargs = transport_kwargs
+        self._transport = self._init_transport(transport=transport, **transport_kwargs)
+
+        self._mounts: dict[URLPattern, AsyncBaseTransport | None] = {}
         if mounts is not None:
             self._mounts.update(
                 {URLPattern(key): transport for key, transport in mounts.items()}
             )
         self._mounts = dict(sorted(self._mounts.items()))
+        self._proxy_transports: dict[Proxy, AsyncBaseTransport] = {}
 
     def _init_transport(
         self,
@@ -1471,16 +1562,44 @@ class AsyncClient(BaseClient):
             proxy=proxy,
         )
 
-    def _transport_for_url(self, url: URL) -> AsyncBaseTransport:
-        """
-        Returns the transport instance that should be used for a given URL.
-        This will either be the standard connection pool, or a proxy.
-        """
-        for pattern, transport in self._mounts.items():
-            if pattern.matches(url):
-                return self._transport if transport is None else transport
+    def proxy_route(self, request: Request) -> ProxyRoute:
+        return self._proxy_policy.route_for_url(
+            request.url,
+            proxy=request.extensions.get("proxy"),
+            redirected_from=request.extensions.get("previous_url"),
+        )
 
+    def _transport_for_request(self, request: Request) -> AsyncBaseTransport:
+        route = self.proxy_route(request)
+        if route.is_rejected:
+            raise ValueError(route.reason)
+
+        for pattern, transport in self._mounts.items():
+            if pattern.matches(request.url):
+                selected = self._transport if transport is None else transport
+                if route.is_proxy:
+                    raise ValueError(
+                        f"Per-request proxy {route.proxy.url} cannot override the "
+                        f"explicit mount {pattern.pattern!r}."
+                    )
+                return selected
+
+        if route.is_proxy:
+            assert route.proxy is not None
+            if type(self._transport).__name__ in ("ASGITransport", "WSGITransport"):
+                raise ValueError(
+                    "ASGI and WSGI transports cannot be used with an HTTP proxy."
+                )
+            if route.proxy not in self._proxy_transports:
+                self._proxy_transports[route.proxy] = self._init_proxy_transport(
+                    route.proxy, **self._proxy_transport_kwargs
+                )
+            return self._proxy_transports[route.proxy]
         return self._transport
+
+    def _transport_for_url(self, url: URL) -> AsyncBaseTransport:
+        request = Request("GET", url)
+        return self._transport_for_request(request)
 
     async def request(
         self,
@@ -1497,6 +1616,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1535,9 +1655,15 @@ class AsyncClient(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
-        return await self.send(request, auth=auth, follow_redirects=follow_redirects)
+        return await self.send(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            proxy=proxy,
+        )
 
     @asynccontextmanager
     async def stream(
@@ -1555,6 +1681,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> typing.AsyncIterator[Response]:
         """
@@ -1578,6 +1705,7 @@ class AsyncClient(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
         response = await self.send(
@@ -1598,6 +1726,7 @@ class AsyncClient(BaseClient):
         stream: bool = False,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
     ) -> Response:
         """
         Send a request.
@@ -1623,6 +1752,8 @@ class AsyncClient(BaseClient):
         )
 
         self._set_timeout(request)
+        if proxy is not None:
+            request.extensions["proxy"] = proxy
 
         auth = self._build_request_auth(request, auth)
 
@@ -1718,7 +1849,8 @@ class AsyncClient(BaseClient):
         """
         Sends a single request, without handling any redirections.
         """
-        transport = self._transport_for_url(request.url)
+        route = self.proxy_route(request)
+        transport = self._transport_for_request(request)
         start = time.perf_counter()
 
         if not isinstance(request.stream, AsyncByteStream):
@@ -1726,11 +1858,21 @@ class AsyncClient(BaseClient):
                 "Attempted to send an sync request with an AsyncClient instance."
             )
 
-        with request_context(request=request):
-            response = await transport.handle_async_request(request)
+        extensions = request.extensions
+        request.extensions = {
+            key: value
+            for key, value in extensions.items()
+            if key not in ("proxy", "previous_url")
+        }
+        try:
+            with request_context(request=request):
+                response = await transport.handle_async_request(request)
+        finally:
+            request.extensions = extensions
 
         assert isinstance(response.stream, AsyncByteStream)
         response.request = request
+        response.proxy_route = route
         response.stream = BoundAsyncStream(
             response.stream, response=response, start=start
         )
@@ -1745,6 +1887,8 @@ class AsyncClient(BaseClient):
             response.status_code,
             response.reason_phrase,
         )
+        for reason in route.reasons:
+            logger.debug("%s", reason)
 
         return response
 
@@ -1758,6 +1902,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1774,6 +1919,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1787,6 +1933,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1803,6 +1950,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1816,6 +1964,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1832,6 +1981,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1849,6 +1999,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1869,6 +2020,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1886,6 +2038,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1906,6 +2059,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1923,6 +2077,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1943,6 +2098,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1956,6 +2112,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        proxy: ProxyTypes | bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1972,6 +2129,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            proxy=proxy,
             extensions=extensions,
         )
 
@@ -1983,9 +2141,11 @@ class AsyncClient(BaseClient):
             self._state = ClientState.CLOSED
 
             await self._transport.aclose()
-            for proxy in self._mounts.values():
-                if proxy is not None:
-                    await proxy.aclose()
+            for transport in self._mounts.values():
+                if transport is not None and transport is not self._transport:
+                    await transport.aclose()
+            for transport in self._proxy_transports.values():
+                await transport.aclose()
 
     async def __aenter__(self: U) -> U:
         if self._state != ClientState.UNOPENED:
@@ -2000,9 +2160,11 @@ class AsyncClient(BaseClient):
         self._state = ClientState.OPENED
 
         await self._transport.__aenter__()
-        for proxy in self._mounts.values():
-            if proxy is not None:
-                await proxy.__aenter__()
+        for transport in self._mounts.values():
+            if transport is not None and transport is not self._transport:
+                await transport.__aenter__()
+        for transport in self._proxy_transports.values():
+            await transport.__aenter__()
         return self
 
     async def __aexit__(
@@ -2014,6 +2176,8 @@ class AsyncClient(BaseClient):
         self._state = ClientState.CLOSED
 
         await self._transport.__aexit__(exc_type, exc_value, traceback)
-        for proxy in self._mounts.values():
-            if proxy is not None:
-                await proxy.__aexit__(exc_type, exc_value, traceback)
+        for transport in self._mounts.values():
+            if transport is not None and transport is not self._transport:
+                await transport.__aexit__(exc_type, exc_value, traceback)
+        for transport in self._proxy_transports.values():
+            await transport.__aexit__(exc_type, exc_value, traceback)
