@@ -4,7 +4,6 @@ import ipaddress
 import os
 import re
 import typing
-from urllib.request import getproxies
 
 from ._types import PrimitiveData
 
@@ -30,48 +29,44 @@ def primitive_value_to_str(value: PrimitiveData) -> str:
 def get_environment_proxies() -> dict[str, str | None]:
     """Gets proxy information from the environment"""
 
-    # urllib.request.getproxies() falls back on System
-    # Registry and Config for proxies on Windows and macOS.
-    # We don't want to propagate non-HTTP proxies into
-    # our configuration such as 'TRAVIS_APT_PROXY'.
-    proxy_info = getproxies()
+    from ._proxy import ProxyPolicy
+
+    policy = ProxyPolicy(trust_env=True)
     mounts: dict[str, str | None] = {}
 
-    for scheme in ("http", "https", "all"):
-        if proxy_info.get(scheme):
-            hostname = proxy_info[scheme]
-            mounts[f"{scheme}://"] = (
-                hostname if "://" in hostname else f"http://{hostname}"
-            )
+    for pattern, proxy in policy._environment.get("proxies", {}).items():
+        mounts[f"{pattern}://"] = str(proxy.url)
 
-    no_proxy_hosts = [host.strip() for host in proxy_info.get("no", "").split(",")]
-    for hostname in no_proxy_hosts:
-        # See https://curl.haxx.se/libcurl/c/CURLOPT_NOPROXY.html for details
-        # on how names in `NO_PROXY` are handled.
-        if hostname == "*":
-            # If NO_PROXY=* is used or if "*" occurs as any one of the comma
-            # separated hostnames, then we should just bypass any information
-            # from HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and always ignore
-            # proxies.
+    for rule in policy._environment.get("no_proxy", []):
+        if rule.host == "*":
             return {}
-        elif hostname:
-            # NO_PROXY=.google.com is marked as "all://*.google.com,
-            #   which disables "www.google.com" but not "google.com"
-            # NO_PROXY=google.com is marked as "all://*google.com,
-            #   which disables "www.google.com" and "google.com".
-            #   (But not "wwwgoogle.com")
-            # NO_PROXY can include domains, IPv6, IPv4 addresses and "localhost"
-            #   NO_PROXY=example.com,::1,localhost,192.168.0.0/16
-            if "://" in hostname:
-                mounts[hostname] = None
-            elif is_ipv4_hostname(hostname):
-                mounts[f"all://{hostname}"] = None
-            elif is_ipv6_hostname(hostname):
-                mounts[f"all://[{hostname}]"] = None
-            elif hostname.lower() == "localhost":
-                mounts[f"all://{hostname}"] = None
+        if rule.scheme != "all":
+            mounts[rule.token] = None
+            continue
+
+        port_suffix = f":{rule.port}" if rule.port is not None else ""
+        if rule.network is not None:
+            prefix_text = str(rule.network.prefixlen)
+            if rule.network.version == 6:
+                authority = f"[{rule.host}/{prefix_text}]"
             else:
-                mounts[f"all://*{hostname}"] = None
+                authority = f"{rule.host}/{prefix_text}"
+        else:
+            try:
+                address = ipaddress.ip_address(rule.host)
+            except ValueError:
+                if rule.host == "localhost":
+                    authority = rule.host
+                else:
+                    prefix = "*." if rule.subdomains_only else "*"
+                    authority = f"{prefix}{rule.host}"
+            else:
+                authority = (
+                    f"[{address}]"
+                    if isinstance(address, ipaddress.IPv6Address)
+                    else str(address)
+                )
+        mounts[f"all://{authority}{port_suffix}"] = None
 
     return mounts
 
@@ -172,7 +167,7 @@ class URLPattern:
         url = URL(pattern)
         self.pattern = pattern
         self.scheme = "" if url.scheme == "all" else url.scheme
-        self.host = "" if url.host == "*" else url.host
+        self.host = "" if url.host == "*" else _pattern_host(url)
         self.port = url.port
         if not url.host or url.host == "*":
             self.host_regex: typing.Pattern[str] | None = None
@@ -195,10 +190,13 @@ class URLPattern:
         if (
             self.host
             and self.host_regex is not None
-            and not self.host_regex.match(other.host)
+            and not self.host_regex.match(_pattern_host(other))
         ):
             return False
-        if self.port is not None and self.port != other.port:
+        other_port = other.port
+        if other_port is None:
+            other_port = {"http": 80, "https": 443}.get(other.scheme)
+        if self.port is not None and self.port != other_port:
             return False
         return True
 
@@ -226,17 +224,9 @@ class URLPattern:
         return isinstance(other, URLPattern) and self.pattern == other.pattern
 
 
-def is_ipv4_hostname(hostname: str) -> bool:
+def _pattern_host(url: URL) -> str:
+    host = url.raw_host.decode("ascii").lower().rstrip(".")
     try:
-        ipaddress.IPv4Address(hostname.split("/")[0])
-    except Exception:
-        return False
-    return True
-
-
-def is_ipv6_hostname(hostname: str) -> bool:
-    try:
-        ipaddress.IPv6Address(hostname.split("/")[0])
-    except Exception:
-        return False
-    return True
+        return str(ipaddress.ip_address(host)).lower()
+    except ValueError:
+        return host

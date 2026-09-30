@@ -40,7 +40,7 @@ def clean_environ():
         {
             k: v
             for k, v in original_environ.items()
-            if k not in ENVIRONMENT_VARIABLES and k.lower() not in ENVIRONMENT_VARIABLES
+            if k.lower() not in {name.lower() for name in ENVIRONMENT_VARIABLES}
         }
     )
     yield

@@ -6,6 +6,7 @@ from ._config import *
 from ._content import *
 from ._exceptions import *
 from ._models import *
+from ._proxy import *
 from ._status_codes import *
 from ._transports import *
 from ._types import *
@@ -69,7 +70,9 @@ __all__ = [
     "post",
     "ProtocolError",
     "Proxy",
+    "ProxyDecision",
     "ProxyError",
+    "ProxyPolicy",
     "put",
     "QueryParams",
     "ReadError",

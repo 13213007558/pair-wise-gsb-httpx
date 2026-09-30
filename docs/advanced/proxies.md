@@ -35,6 +35,41 @@ For detailed information about proxy routing, see the [Routing](#routing) sectio
 
     For more information, see [FORWARD vs TUNNEL](#forward-vs-tunnel).
 
+## Routing policy
+
+Use `httpx.ProxyPolicy` when proxy routing needs to be explicit. The policy can
+read environment variables, accept a client mapping, and be overridden for an
+individual request:
+
+```python
+policy = httpx.ProxyPolicy(
+    proxies={
+        "http://": "http://localhost:8030",
+        "https://": "http://localhost:8031",
+    },
+    no_proxy=[".internal.example", "10.0.0.0/8", "[::1]:443"],
+)
+
+with httpx.Client(proxy_policy=policy) as client:
+    # Force one request through a specific proxy.
+    client.get("https://example.com", proxy="http://localhost:8032")
+
+    # Bypass every configured proxy for one request.
+    client.get("https://example.com", proxy=False)
+```
+
+`NO_PROXY` is evaluated before selecting `HTTP_PROXY`, `HTTPS_PROXY`, or
+`ALL_PROXY`. It matches scheme, normalized host, and effective port: absent
+ports mean 80 for HTTP and 443 for HTTPS. Hostnames are case-insensitive,
+trailing dots are ignored, IPv6 literals use square brackets, and CIDR ranges
+can include a port such as `10.0.0.0/8:443` or `[2001:db8::]/32:443`.
+
+The selected route is available on the response as
+`response.extensions["proxy_route"]`. Its `reason` field records whether the
+connection is direct or proxied; for HTTPS through an HTTP proxy, `connect_line`
+contains the CONNECT authority. Ambiguous or malformed `NO_PROXY` tokens raise
+`ValueError` when the policy is constructed.
+
 ## Authentication
 
 Proxy credentials can be passed as the `userinfo` section of the proxy URL. For example:

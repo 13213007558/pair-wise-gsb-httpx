@@ -242,6 +242,17 @@ class Proxy:
         headers_str = f", headers={dict(self.headers)!r}" if self.headers else ""
         return f"Proxy({url_str}{auth_str}{headers_str})"
 
+    def __eq__(self, other: typing.Any) -> bool:
+        return (
+            isinstance(other, Proxy)
+            and self.url == other.url
+            and self.auth == other.auth
+            and self.headers == other.headers
+        )
+
+    def __hash__(self) -> int:
+        return hash(self.url)
+
 
 DEFAULT_TIMEOUT_CONFIG = Timeout(timeout=5.0)
 DEFAULT_LIMITS = Limits(max_connections=100, max_keepalive_connections=20)
