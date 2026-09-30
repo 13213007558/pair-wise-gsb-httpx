@@ -42,6 +42,7 @@ from ._types import (
     RequestData,
     RequestExtensions,
     RequestFiles,
+    SameSitePolicyTypes,
     SyncByteStream,
     TimeoutTypes,
 )
@@ -193,6 +194,7 @@ class BaseClient:
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        same_site_policy: SameSitePolicyTypes = "rfc6265",
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
         follow_redirects: bool = False,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
@@ -208,7 +210,7 @@ class BaseClient:
         self._auth = self._build_auth(auth)
         self._params = QueryParams(params)
         self.headers = Headers(headers)
-        self._cookies = Cookies(cookies)
+        self._cookies = Cookies(cookies, same_site_policy=same_site_policy)
         self._timeout = Timeout(timeout)
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
@@ -324,7 +326,15 @@ class BaseClient:
 
     @cookies.setter
     def cookies(self, cookies: CookieTypes) -> None:
-        self._cookies = Cookies(cookies)
+        self._cookies = Cookies(cookies, same_site_policy=self.same_site_policy)
+
+    @property
+    def same_site_policy(self) -> str:
+        return self._cookies.same_site_policy.value
+
+    @same_site_policy.setter
+    def same_site_policy(self, value: SameSitePolicyTypes) -> None:
+        self._cookies = Cookies(self._cookies, same_site_policy=value)
 
     @property
     def params(self) -> QueryParams:
@@ -416,7 +426,9 @@ class BaseClient:
         to create the cookies used for the outgoing request.
         """
         if cookies or self.cookies:
-            merged_cookies = Cookies(self.cookies)
+            merged_cookies = Cookies(
+                self.cookies, same_site_policy=self.same_site_policy
+            )
             merged_cookies.update(cookies)
             return merged_cookies
         return cookies
@@ -481,14 +493,17 @@ class BaseClient:
         url = self._redirect_url(request, response)
         headers = self._redirect_headers(request, url, method)
         stream = self._redirect_stream(request, method)
-        cookies = Cookies(self.cookies)
+        cookies = Cookies(self.cookies, same_site_policy=self.same_site_policy)
+        extensions = dict(request.extensions)
+        if url.scheme != request.url.scheme or url.host != request.url.host:
+            extensions["samesite_initiator"] = self.cookies._site_key(request.url)
         return Request(
             method=method,
             url=url,
             headers=headers,
             cookies=cookies,
             stream=stream,
-            extensions=request.extensions,
+            extensions=extensions,
         )
 
     def _redirect_method(self, request: Request, response: Response) -> str:
@@ -614,6 +629,9 @@ class Client(BaseClient):
     sending requests.
     * **cookies** - *(optional)* Dictionary of Cookie items to include when
     sending requests.
+    * **same_site_policy** - *(optional)* Cookie sending policy. Use
+    `"rfc6265"` (the default) for legacy-compatible sending, or `"lax"` /
+    `"strict"` for browser-style SameSite enforcement.
     * **verify** - *(optional)* Either `True` to use an SSL context with the
     default CA bundle, `False` to disable verification, or an instance of
     `ssl.SSLContext` to use a custom context.
@@ -643,6 +661,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        same_site_policy: SameSitePolicyTypes = "rfc6265",
         verify: ssl.SSLContext | str | bool = True,
         cert: CertTypes | None = None,
         trust_env: bool = True,
@@ -664,6 +683,7 @@ class Client(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            same_site_policy=same_site_policy,
             timeout=timeout,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
@@ -1010,6 +1030,8 @@ class Client(BaseClient):
                 "Attempted to send an async request with a sync Client instance."
             )
 
+        self.cookies.set_cookie_header(request)
+
         with request_context(request=request):
             response = transport.handle_request(request)
 
@@ -1328,6 +1350,9 @@ class AsyncClient(BaseClient):
     sending requests.
     * **cookies** - *(optional)* Dictionary of Cookie items to include when
     sending requests.
+    * **same_site_policy** - *(optional)* Cookie sending policy. Use
+    `"rfc6265"` (the default) for legacy-compatible sending, or `"lax"` /
+    `"strict"` for browser-style SameSite enforcement.
     * **verify** - *(optional)* Either `True` to use an SSL context with the
     default CA bundle, `False` to disable verification, or an instance of
     `ssl.SSLContext` to use a custom context.
@@ -1357,6 +1382,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        same_site_policy: SameSitePolicyTypes = "rfc6265",
         verify: ssl.SSLContext | str | bool = True,
         cert: CertTypes | None = None,
         http1: bool = True,
@@ -1378,6 +1404,7 @@ class AsyncClient(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            same_site_policy=same_site_policy,
             timeout=timeout,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
@@ -1725,6 +1752,8 @@ class AsyncClient(BaseClient):
             raise RuntimeError(
                 "Attempted to send an sync request with an AsyncClient instance."
             )
+
+        self.cookies.set_cookie_header(request)
 
         with request_context(request=request):
             response = await transport.handle_async_request(request)

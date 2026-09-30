@@ -104,6 +104,13 @@ For response bodies, assuming the server didn't send an explicit encoding then H
 
 If using a client instance, then cookies should always be set on the client rather than on a per-request basis.
 
+The default cookie sending mode is RFC 6265-compatible and does not enforce
+`SameSite`; this preserves HTTPX 0.28 behaviour. Opt into browser-style sending
+with `same_site_policy="lax"` or `same_site_policy="strict"`. In either opt-in
+mode, domain, path, expiry, port, scheme and SameSite are recalculated for each
+request, redirect hop, and authentication retry. A manually supplied `Cookie`
+header cannot bypass the active policy.
+
 This usage is supported:
 
 ```python

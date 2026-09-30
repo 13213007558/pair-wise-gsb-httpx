@@ -403,6 +403,13 @@ To include cookies in an outgoing request, use the `cookies` parameter:
 Cookies are returned in a `Cookies` instance, which is a dict-like data structure
 with additional API for accessing cookies by their domain or path.
 
+`Client` and `AsyncClient` keep the legacy RFC 6265 behaviour by default, so
+explicit `SameSite` attributes are not used to suppress cookies. Pass
+`same_site_policy="lax"` or `same_site_policy="strict"` for browser-style
+filtering. The active policy is reapplied before every transport call,
+including redirect hops and authentication retries, and also filters cookies
+supplied through a manual `Cookie` header.
+
 ```pycon
 >>> cookies = httpx.Cookies()
 >>> cookies.set('cookie_on_domain', 'hello, there!', domain='httpbin.org')

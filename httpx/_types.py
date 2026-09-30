@@ -24,7 +24,7 @@ from typing import (
 if TYPE_CHECKING:  # pragma: no cover
     from ._auth import Auth  # noqa: F401
     from ._config import Proxy, Timeout  # noqa: F401
-    from ._models import Cookies, Headers, Request  # noqa: F401
+    from ._models import Cookies, Headers, Request, SameSitePolicy  # noqa: F401
     from ._urls import URL, QueryParams  # noqa: F401
 
 
@@ -50,6 +50,7 @@ HeaderTypes = Union[
 ]
 
 CookieTypes = Union["Cookies", CookieJar, Dict[str, str], List[Tuple[str, str]]]
+SameSitePolicyTypes = Union["SameSitePolicy", str]
 
 TimeoutTypes = Union[
     Optional[float],
