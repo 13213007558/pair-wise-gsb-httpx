@@ -3,13 +3,23 @@ from __future__ import annotations
 import codecs
 import datetime
 import email.message
+import http.cookies
+import ipaddress
 import json as jsonlib
 import re
+import threading
 import typing
 import urllib.request
 from collections.abc import Mapping
-from http.cookiejar import Cookie, CookieJar
+from http.cookiejar import Cookie
 
+from ._cookies import (
+    PUBLIC_SUFFIXES,
+    PolicyCookieJar,
+    RFC6265,
+    SameSitePolicy,
+    same_site,
+)
 from ._content import ByteStream, UnattachedStream, encode_request, encode_response
 from ._decoders import (
     SUPPORTED_DECODERS,
@@ -400,8 +410,26 @@ class Request:
         self.headers = Headers(headers)
         self.extensions = {} if extensions is None else dict(extensions)
 
+        manual_cookie_policy = (
+            cookies.same_site_policy
+            if isinstance(cookies, Cookies)
+            else RFC6265
+        )
+        manual_cookies = Cookies(same_site_policy=manual_cookie_policy)
         if cookies:
-            Cookies(cookies).set_cookie_header(self)
+            manual_cookies = Cookies(
+                cookies, same_site_policy=manual_cookie_policy
+            )
+        raw_cookie = self.headers.get("Cookie")
+        self._raw_cookie_header = raw_cookie
+        if raw_cookie is not None:
+            manual_cookies.update(
+                manual_cookies.from_cookie_header(raw_cookie, self.url)
+            )
+        self._manual_cookies = manual_cookies
+        self._cookie_origin_url: URL | None = None
+        if raw_cookie is None:
+            manual_cookies.set_cookie_header(self)
 
         if stream is None:
             content_type: str | None = self.headers.get("content-type")
@@ -502,7 +530,8 @@ class Request:
         return {
             name: value
             for name, value in self.__dict__.items()
-            if name not in ["extensions", "stream"]
+            if name
+            not in ["extensions", "stream", "_manual_cookies", "_raw_cookie_header"]
         }
 
     def __setstate__(self, state: dict[str, typing.Any]) -> None:
@@ -510,6 +539,8 @@ class Request:
             setattr(self, name, value)
         self.extensions = {}
         self.stream = UnattachedStream()
+        self._manual_cookies = Cookies()
+        self._raw_cookie_header = None
 
 
 class Response:
@@ -1081,22 +1112,88 @@ class Cookies(typing.MutableMapping[str, str]):
     HTTP Cookies, as a mutable mapping.
     """
 
-    def __init__(self, cookies: CookieTypes | None = None) -> None:
+    def __init__(
+        self,
+        cookies: CookieTypes | None = None,
+        *,
+        same_site_policy: SameSitePolicy = RFC6265,
+        public_suffixes: typing.Container[str] = PUBLIC_SUFFIXES,
+    ) -> None:
+        self.same_site_policy = same_site_policy.lower()
+        if self.same_site_policy not in {RFC6265, "lax", "strict", "none"}:
+            raise ValueError(
+                f"Unsupported SameSite cookie policy: {same_site_policy!r}"
+            )
+        self.public_suffixes = public_suffixes
+        self._lock = threading.RLock()
         if cookies is None or isinstance(cookies, dict):
-            self.jar = CookieJar()
+            self.jar = self._new_jar()
             if isinstance(cookies, dict):
                 for key, value in cookies.items():
                     self.set(key, value)
         elif isinstance(cookies, list):
-            self.jar = CookieJar()
+            self.jar = self._new_jar()
             for key, value in cookies:
                 self.set(key, value)
         elif isinstance(cookies, Cookies):
-            self.jar = CookieJar()
-            for cookie in cookies.jar:
+            self.jar = self._new_jar()
+            for cookie in list(cookies.jar):
                 self.jar.set_cookie(cookie)
         else:
-            self.jar = cookies
+            self.jar = self._new_jar()
+            for cookie in list(cookies):
+                if not cookie.domain:
+                    cookie = self._global_cookie(cookie)
+                self.jar.set_cookie(cookie)
+
+    def _new_jar(
+        self, same_site_policy: SameSitePolicy | None = None
+    ) -> PolicyCookieJar:
+        return PolicyCookieJar(
+            policy=self.same_site_policy
+            if same_site_policy is None
+            else same_site_policy,
+            public_suffixes=self.public_suffixes,
+        )
+
+    def _global_cookie(self, cookie: Cookie) -> Cookie:
+        rest = dict(cookie._rest)
+        rest["_HTTPX_GLOBAL"] = True
+        return Cookie(
+            cookie.version,
+            cookie.name,
+            cookie.value,
+            cookie.port,
+            cookie.port_specified,
+            cookie.domain,
+            cookie.domain_specified,
+            True,
+            cookie.path,
+            cookie.path_specified,
+            cookie.secure,
+            cookie.expires,
+            cookie.discard,
+            cookie.comment,
+            cookie.comment_url,
+            rest,
+            cookie.rfc2109,
+        )
+
+    def copy(self) -> Cookies:
+        return self.__copy__()
+
+    def __copy__(self) -> Cookies:
+        cookies = type(self)(
+            same_site_policy=self.same_site_policy,
+            public_suffixes=self.public_suffixes,
+        )
+        with self._lock:
+            for cookie in list(self.jar):
+                cookies.jar.set_cookie(cookie)
+        return cookies
+
+    def __deepcopy__(self, memo: dict[int, typing.Any]) -> Cookies:
+        return self.__copy__()
 
     def extract_cookies(self, response: Response) -> None:
         """
@@ -1105,28 +1202,85 @@ class Cookies(typing.MutableMapping[str, str]):
         urllib_response = self._CookieCompatResponse(response)
         urllib_request = self._CookieCompatRequest(response.request)
 
-        self.jar.extract_cookies(urllib_response, urllib_request)  # type: ignore
+        with self._lock:
+            self.jar.extract_cookies(urllib_response, urllib_request)  # type: ignore
 
     def set_cookie_header(self, request: Request) -> None:
         """
         Sets an appropriate 'Cookie:' HTTP header on the `Request`.
         """
+        request.headers.pop("Cookie", None)
+        merged = self._new_jar()
+        with self._lock:
+            persistent_cookies = list(self.jar)
+        for cookie in persistent_cookies:
+            merged.set_cookie(cookie)
+        manual_cookies = getattr(request, "_manual_cookies", None)
+        if manual_cookies is not None:
+            for cookie in list(manual_cookies.jar):
+                try:
+                    merged.clear(cookie.domain, cookie.path, cookie.name)
+                except KeyError:
+                    pass
+                merged.set_cookie(cookie)
         urllib_request = self._CookieCompatRequest(request)
-        self.jar.add_cookie_header(urllib_request)
+        merged.add_cookie_header(urllib_request)
+
+    def from_cookie_header(self, value: str, url: URL) -> Cookies:
+        cookies = type(self)(same_site_policy=RFC6265)
+        parsed = http.cookies.SimpleCookie()
+        try:
+            parsed.load(value)
+        except http.cookies.CookieError:
+            return cookies
+        host = url.raw_host.decode("ascii")
+        path = url.raw_path.decode("ascii").split("?", 1)[0]
+        path = path[: path.rfind("/") + 1] or "/"
+        for morsel in parsed.values():
+            cookie = Cookie(
+                version=0,
+                name=morsel.key,
+                value=morsel.value,
+                port=None,
+                port_specified=False,
+                domain=host,
+                domain_specified=False,
+                domain_initial_dot=False,
+                path=path,
+                path_specified=True,
+                secure=url.scheme == "https",
+                expires=None,
+                discard=True,
+                comment=None,
+                comment_url=None,
+                rest={},
+                rfc2109=False,
+            )
+            cookies.jar.set_cookie(cookie)
+        return cookies
 
     def set(self, name: str, value: str, domain: str = "", path: str = "/") -> None:
         """
         Set a cookie value by name. May optionally include domain and path.
         """
+        normalized_domain = domain
+        try:
+            ipaddress.ip_address(domain.strip("[]"))
+        except ValueError:
+            pass
+        else:
+            normalized_domain = domain.strip("[]")
+
         kwargs = {
             "version": 0,
             "name": name,
             "value": value,
             "port": None,
             "port_specified": False,
-            "domain": domain,
-            "domain_specified": bool(domain),
-            "domain_initial_dot": domain.startswith("."),
+            "domain": normalized_domain,
+            "domain_specified": bool(normalized_domain),
+            "domain_initial_dot": normalized_domain.startswith(".")
+            or not normalized_domain,
             "path": path,
             "path_specified": bool(path),
             "secure": False,
@@ -1134,7 +1288,9 @@ class Cookies(typing.MutableMapping[str, str]):
             "discard": True,
             "comment": None,
             "comment_url": None,
-            "rest": {"HttpOnly": None},
+            "rest": {"HttpOnly": None, "_HTTPX_GLOBAL": True}
+            if not normalized_domain
+            else {"HttpOnly": None},
             "rfc2109": False,
         }
         cookie = Cookie(**kwargs)  # type: ignore
@@ -1152,7 +1308,9 @@ class Cookies(typing.MutableMapping[str, str]):
         in order to specify exactly which cookie to retrieve.
         """
         value = None
-        for cookie in self.jar:
+        with self._lock:
+            cookies = list(self.jar)
+        for cookie in cookies:
             if cookie.name == name:
                 if domain is None or cookie.domain == domain:
                     if path is None or cookie.path == path:
@@ -1178,9 +1336,11 @@ class Cookies(typing.MutableMapping[str, str]):
         if domain is not None and path is not None:
             return self.jar.clear(domain, path, name)
 
+        with self._lock:
+            cookies = list(self.jar)
         remove = [
             cookie
-            for cookie in self.jar
+            for cookie in cookies
             if cookie.name == name
             and (domain is None or cookie.domain == domain)
             and (path is None or cookie.path == path)
@@ -1204,7 +1364,7 @@ class Cookies(typing.MutableMapping[str, str]):
 
     def update(self, cookies: CookieTypes | None = None) -> None:  # type: ignore
         cookies = Cookies(cookies)
-        for cookie in cookies.jar:
+        for cookie in list(cookies.jar):
             self.jar.set_cookie(cookie)
 
     def __setitem__(self, name: str, value: str) -> None:
@@ -1220,21 +1380,25 @@ class Cookies(typing.MutableMapping[str, str]):
         return self.delete(name)
 
     def __len__(self) -> int:
-        return len(self.jar)
+        with self._lock:
+            return len(self.jar)
 
     def __iter__(self) -> typing.Iterator[str]:
-        return (cookie.name for cookie in self.jar)
+        with self._lock:
+            names = [cookie.name for cookie in self.jar]
+        return iter(names)
 
     def __bool__(self) -> bool:
-        for _ in self.jar:
-            return True
-        return False
+        with self._lock:
+            return bool(self.jar)
 
     def __repr__(self) -> str:
+        with self._lock:
+            cookies = list(self.jar)
         cookies_repr = ", ".join(
             [
                 f"<Cookie {cookie.name}={cookie.value} for {cookie.domain} />"
-                for cookie in self.jar
+                for cookie in cookies
             ]
         )
 
@@ -1253,6 +1417,14 @@ class Cookies(typing.MutableMapping[str, str]):
                 method=request.method,
             )
             self.request = request
+            origin_url = getattr(request, "_cookie_origin_url", None)
+            self.httpx_same_site = same_site(
+                request.url.scheme,
+                request.url.raw_host.decode("ascii"),
+                origin_url.scheme if origin_url is not None else None,
+                origin_url.raw_host.decode("ascii") if origin_url is not None else None,
+            )
+            self.httpx_top_level = True
 
         def add_unredirected_header(self, key: str, value: str) -> None:
             super().add_unredirected_header(key, value)

@@ -150,7 +150,7 @@ what gets sent over the wire.*
 >>> cookies.set("name", "value", domain="example.org")
 ```
 
-* `def __init__(cookies: [dict, Cookies, CookieJar])`
+* `def __init__(cookies=None, same_site_policy="rfc6265", public_suffixes=None)`
 * `.jar` - **CookieJar**
 * `def extract_cookies(response)`
 * `def set_cookie_header(request)`

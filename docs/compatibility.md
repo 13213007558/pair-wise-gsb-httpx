@@ -120,6 +120,10 @@ client.post(..., cookies=...)
 
 We prefer enforcing a stricter API here because it provides clearer expectations around cookie persistence, particularly when redirects occur.
 
+HTTPX defaults to the legacy RFC 6265 cookie selection behavior. Clients may opt in to browser-style SameSite selection with `same_site_policy="lax"`, `"strict"`, or `"none"`. When enabled, cookies are re-evaluated immediately before every transport call, including redirect hops and authentication retries. Secure cookies are only sent over secure schemes, path and port constraints are checked for each request, and domain matching treats IP literals exactly. SameSite site comparison is schemeful and uses the registrable domain. A built-in fallback covers common multi-label public suffixes, but it is not a complete Public Suffix List; applications with strict domain-boundary requirements can provide the list by constructing `Cookies(..., public_suffixes=...)` before passing the jar to a client.
+
+Explicitly supplied `Cookie` headers are honored on the originating request. They are not copied to a redirect request when their host-only and path-matching cookies would not be sent there.
+
 ## Status Codes
 
 In our documentation we prefer the uppercased versions, such as `codes.NOT_FOUND`, but also provide lower-cased versions for API compatibility with `requests`.

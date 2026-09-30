@@ -133,7 +133,6 @@ def test_digest_auth_setting_cookie_in_request():
 
     request = flow.send(response)
     assert request.headers["Authorization"].startswith("Digest")
-    assert request.headers["Cookie"] == "session=.session_value..."
 
     # No other requests are made.
     response = httpx.Response(
