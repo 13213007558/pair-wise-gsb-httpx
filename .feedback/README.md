@@ -11,12 +11,12 @@ From the repository root:
 export NO_INTERNET=1 TZ=UTC
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r .feedback/requirements.txt -e .
-.venv/bin/python -m pytest -q -o addopts= tests/test_auth.py tests/test_config.py tests/test_asgi.py tests/test_wsgi.py tests/client/test_event_hooks.py tests/client/test_redirects.py
+.venv/bin/python -m pytest -q -o addopts= tests/test_auth.py tests/test_config.py tests/test_asgi.py tests/test_wsgi.py tests/client/test_event_hooks.py tests/client/test_redirects.py -k 'not test_SSLContext_with_get_request'
 ```
 
-Scope note: The scope is the command below, not all optional upstream integrations.
+Scope note: Selected in-memory tests. Excludes test_SSLContext_with_get_request because its upstream fixture binds a fixed local port; parallel task workspaces must not share that listener.
 
-Observed baseline (2026-11-10): `112 passed in 0.31s`
-Whole-command wall time: 1.028 seconds, exit code 0. This is one local measurement, not a runtime guarantee. The first install is excluded.
+Observed baseline (2026-11-10): `111 passed, 1 deselected in 0.34s`
+Whole-command wall time: 0.692 seconds, exit code 0. This is one local measurement, not a runtime guarantee. The first install is excluded.
 
 This seed adds preparation metadata only. Application sources and upstream tests are unchanged; there is no task solution in this commit.
