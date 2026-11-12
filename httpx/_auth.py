@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading
 import time
 import typing
 from base64 import b64encode
@@ -10,6 +11,7 @@ from urllib.request import parse_http_list
 
 from ._exceptions import ProtocolError
 from ._models import Cookies, Request, Response
+from ._urls import URL
 from ._utils import to_bytes, to_str, unquote
 
 if typing.TYPE_CHECKING:  # pragma: no cover
@@ -187,13 +189,18 @@ class DigestAuth(Auth):
     def __init__(self, username: str | bytes, password: str | bytes) -> None:
         self._username = to_bytes(username)
         self._password = to_bytes(password)
-        self._last_challenge: _DigestAuthChallenge | None = None
-        self._nonce_count = 1
+        # Received challenges are cached by protection space, keyed on
+        # the scheme, host, effective port, and realm. This ensures that
+        # a challenge is only ever reused against the origin it came from.
+        self._challenges: dict[tuple[str, str, int, bytes], _DigestAuthState] = {}
+        self._lock = threading.Lock()
 
     def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
-        if self._last_challenge:
+        cached = self._get_cached_challenge(request.url)
+        if cached is not None:
+            challenge, nonce_count = cached
             request.headers["Authorization"] = self._build_auth_header(
-                request, self._last_challenge
+                request, challenge, nonce_count
             )
 
         response = yield request
@@ -211,15 +218,84 @@ class DigestAuth(Auth):
             # header, then we don't need to build an authenticated request.
             return
 
-        self._last_challenge = self._parse_challenge(request, response, auth_header)
-        self._nonce_count = 1
+        # The challenge belongs to the origin that sent the 401 response,
+        # which may differ from the origin of the original request if
+        # redirects were followed.
+        try:
+            challenge_url = response.request.url
+        except RuntimeError:
+            challenge_url = request.url
+
+        challenge = self._parse_challenge(request, response, auth_header)
+        self._validate_challenge(challenge, request=request)
+
+        if self._origin_key(challenge_url) != self._origin_key(request.url):
+            # The 401 response came from a different origin, for example
+            # after a redirect stripped the 'Authorization' header. The
+            # challenge is cached for future requests to that origin, but
+            # must not be attached to a request sent to this origin.
+            self._cache_challenge(challenge_url, challenge, consume=False)
+            return
+
+        nonce_count = self._cache_challenge(challenge_url, challenge)
 
         request.headers["Authorization"] = self._build_auth_header(
-            request, self._last_challenge
+            request, challenge, nonce_count
         )
         if response.cookies:
             Cookies(response.cookies).set_cookie_header(request=request)
         yield request
+
+    def _origin_key(self, url: URL) -> tuple[str, str, int]:
+        port = url.port
+        if port is None:
+            port = 443 if url.scheme == "https" else 80
+        return (url.scheme, url.host, port)
+
+    def _get_cached_challenge(
+        self, url: URL
+    ) -> tuple[_DigestAuthChallenge, int] | None:
+        origin = self._origin_key(url)
+        with self._lock:
+            matches = [
+                state for key, state in self._challenges.items() if key[:3] == origin
+            ]
+            if len(matches) != 1:
+                # No cached challenge for this origin, or several realms
+                # cached and we cannot tell which one applies. The request
+                # is sent unauthenticated, and any 401 challenge is handled.
+                return None
+            state = matches[0]
+            nonce_count = state.nonce_count
+            state.nonce_count += 1
+            return state.challenge, nonce_count
+
+    def _cache_challenge(
+        self, url: URL, challenge: _DigestAuthChallenge, consume: bool = True
+    ) -> int:
+        key = self._origin_key(url) + (challenge.realm,)
+        with self._lock:
+            state = self._challenges.get(key)
+            if state is not None and state.challenge.nonce == challenge.nonce:
+                # A re-challenge under the same nonce continues the
+                # nonce count, so that 'nc' values are never repeated.
+                nonce_count = state.nonce_count
+            else:
+                # A new nonce starts the nonce count over.
+                nonce_count = 1
+            next_count = nonce_count + 1 if consume else nonce_count
+            self._challenges[key] = _DigestAuthState(challenge, next_count)
+            return nonce_count
+
+    def _validate_challenge(
+        self, challenge: _DigestAuthChallenge, request: Request
+    ) -> None:
+        # Challenges that we cannot use must not replace any usable
+        # cached state, so they are rejected before being cached.
+        if challenge.algorithm.upper() not in self._ALGORITHM_TO_HASH_FUNCTION:
+            message = f'Unsupported digest algorithm "{challenge.algorithm}"'
+            raise ProtocolError(message, request=request)
+        self._resolve_qop(challenge.qop, request=request)
 
     def _parse_challenge(
         self, request: Request, response: Response, auth_header: str
@@ -253,7 +329,7 @@ class DigestAuth(Auth):
             raise ProtocolError(message, request=request) from exc
 
     def _build_auth_header(
-        self, request: Request, challenge: _DigestAuthChallenge
+        self, request: Request, challenge: _DigestAuthChallenge, nonce_count: int
     ) -> str:
         hash_func = self._ALGORITHM_TO_HASH_FUNCTION[challenge.algorithm.upper()]
 
@@ -267,9 +343,8 @@ class DigestAuth(Auth):
         # TODO: implement auth-int
         HA2 = digest(A2)
 
-        nc_value = b"%08x" % self._nonce_count
-        cnonce = self._get_client_nonce(self._nonce_count, challenge.nonce)
-        self._nonce_count += 1
+        nc_value = b"%08x" % nonce_count
+        cnonce = self._get_client_nonce(nonce_count, challenge.nonce)
 
         HA1 = digest(A1)
         if challenge.algorithm.lower().endswith("-sess"):
@@ -346,3 +421,10 @@ class _DigestAuthChallenge(typing.NamedTuple):
     algorithm: str
     opaque: bytes | None
     qop: bytes | None
+
+
+class _DigestAuthState:
+    def __init__(self, challenge: _DigestAuthChallenge, nonce_count: int) -> None:
+        self.challenge = challenge
+        # The next nonce count to use under the challenge nonce.
+        self.nonce_count = nonce_count

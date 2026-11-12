@@ -632,6 +632,375 @@ def test_sync_digest_auth_raises_protocol_error_on_malformed_header(
             client.get(url, auth=auth)
 
 
+def parse_digest_auth_header(header: str) -> typing.Dict[str, str]:
+    scheme, _, fields = header.partition(" ")
+    assert scheme == "Digest"
+    return parse_keqv_list(fields.split(", "))
+
+
+def test_digest_auth_caches_challenges_per_origin() -> None:
+    """
+    A 'DigestAuth' instance reused across origins must not send the
+    challenge cached for one origin to a different origin.
+    """
+    challenges = {
+        "a.example.org": (
+            'Digest realm="realm-a", qop="auth", nonce="nonce-a", opaque="opaque-a"'
+        ),
+        "b.example.org": (
+            'Digest realm="realm-b", qop="auth", nonce="nonce-b", opaque="opaque-b"'
+        ),
+    }
+    requests: typing.List[typing.Tuple[httpx.Request, typing.Optional[str]]] = []
+
+    def app(request: httpx.Request) -> httpx.Response:
+        requests.append((request, request.headers.get("Authorization")))
+        if "Authorization" not in request.headers:
+            challenge = challenges[request.url.host]
+            return httpx.Response(401, headers={"www-authenticate": challenge})
+        return httpx.Response(200)
+
+    auth = httpx.DigestAuth(username="user", password="password123")
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        response = client.get("http://a.example.org/")
+        assert response.status_code == 200
+
+        # The first request to another origin is sent unauthenticated,
+        # and the 401 response is handled with that origin's challenge.
+        response = client.get("http://b.example.org/")
+        assert response.status_code == 200
+
+        # The cached challenge is reused for further requests to its origin.
+        response = client.get("http://a.example.org/")
+        assert response.status_code == 200
+
+        # A different scheme and effective port is a different protection space.
+        response = client.get("https://a.example.org/")
+        assert response.status_code == 200
+
+    a_requests = [
+        authorization
+        for request, authorization in requests
+        if request.url.host == "a.example.org" and request.url.scheme == "http"
+    ]
+    b_requests = [
+        authorization
+        for request, authorization in requests
+        if request.url.host == "b.example.org"
+    ]
+    https_requests = [
+        authorization
+        for request, authorization in requests
+        if request.url.scheme == "https"
+    ]
+
+    assert len(a_requests) == 3
+    assert a_requests[0] is None
+    fields = parse_digest_auth_header(typing.cast(str, a_requests[1]))
+    assert fields["realm"] == "realm-a"
+    assert fields["nonce"] == "nonce-a"
+    assert fields["nc"] == "00000001"
+    fields = parse_digest_auth_header(typing.cast(str, a_requests[2]))
+    assert fields["realm"] == "realm-a"
+    assert fields["nonce"] == "nonce-a"
+    assert fields["nc"] == "00000002"
+
+    # Host B never sees the challenge cached for host A.
+    assert len(b_requests) == 2
+    assert b_requests[0] is None
+    fields = parse_digest_auth_header(typing.cast(str, b_requests[1]))
+    assert fields["realm"] == "realm-b"
+    assert fields["nonce"] == "nonce-b"
+    assert fields["nc"] == "00000001"
+
+    assert len(https_requests) == 2
+    assert https_requests[0] is None
+    fields = parse_digest_auth_header(typing.cast(str, https_requests[1]))
+    assert fields["realm"] == "realm-a"
+    assert fields["nonce"] == "nonce-a"
+    assert fields["nc"] == "00000001"
+
+
+def test_digest_auth_caches_challenges_per_realm() -> None:
+    """
+    Challenges for different realms on the same origin are cached separately,
+    and interleaved authentication flows each use the challenge they received.
+    """
+    realms = {
+        "/one": ("realm-one", "nonce-one"),
+        "/two": ("realm-two", "nonce-two"),
+    }
+    requests: typing.List[typing.Tuple[httpx.Request, typing.Optional[str]]] = []
+
+    def app(request: httpx.Request) -> httpx.Response:
+        requests.append((request, request.headers.get("Authorization")))
+        realm, nonce = realms[request.url.path]
+        header = request.headers.get("Authorization")
+        if header is not None:
+            fields = parse_digest_auth_header(header)
+            if fields["realm"] == realm and fields["nonce"] == nonce:
+                return httpx.Response(200)
+        challenge = f'Digest realm="{realm}", qop="auth", nonce="{nonce}"'
+        return httpx.Response(401, headers={"www-authenticate": challenge})
+
+    auth = httpx.DigestAuth(username="user", password="password123")
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        response = client.get("http://example.org/one")
+        assert response.status_code == 200
+
+        # The cached realm does not match, so the server re-challenges,
+        # and the retry uses the challenge that was actually received.
+        response = client.get("http://example.org/two")
+        assert response.status_code == 200
+
+        # With two realms cached for the origin the client cannot pick one,
+        # so the request is sent unauthenticated and the 401 is handled.
+        response = client.get("http://example.org/one")
+        assert response.status_code == 200
+
+    one_requests = [
+        authorization
+        for request, authorization in requests
+        if request.url.path == "/one"
+    ]
+    two_requests = [
+        authorization
+        for request, authorization in requests
+        if request.url.path == "/two"
+    ]
+
+    assert len(one_requests) == 4
+    assert one_requests[0] is None
+    fields = parse_digest_auth_header(typing.cast(str, one_requests[1]))
+    assert fields["realm"] == "realm-one"
+    assert fields["nonce"] == "nonce-one"
+    assert fields["nc"] == "00000001"
+    assert one_requests[2] is None
+    # A re-challenge under the same nonce continues the nonce count.
+    # (The preemptive request to '/two' already used nc=2 for this nonce.)
+    fields = parse_digest_auth_header(typing.cast(str, one_requests[3]))
+    assert fields["realm"] == "realm-one"
+    assert fields["nonce"] == "nonce-one"
+    assert fields["nc"] == "00000003"
+
+    assert len(two_requests) == 2
+    fields = parse_digest_auth_header(typing.cast(str, two_requests[0]))
+    assert fields["realm"] == "realm-one"
+    fields = parse_digest_auth_header(typing.cast(str, two_requests[1]))
+    assert fields["realm"] == "realm-two"
+    assert fields["nonce"] == "nonce-two"
+    assert fields["nc"] == "00000001"
+
+
+def test_digest_auth_stale_nonce_switches_nonce_and_resets_count() -> None:
+    """
+    A 401 with a new nonce, such as a 'stale=true' response, switches the
+    cached challenge over to the new nonce and restarts the nonce count.
+    """
+    state = {"nonce": "nonce-1", "stale": "false"}
+    requests: typing.List[typing.Tuple[httpx.Request, typing.Optional[str]]] = []
+
+    def app(request: httpx.Request) -> httpx.Response:
+        requests.append((request, request.headers.get("Authorization")))
+        header = request.headers.get("Authorization")
+        if header is not None:
+            fields = parse_digest_auth_header(header)
+            if fields["nonce"] == state["nonce"]:
+                return httpx.Response(200)
+        challenge = (
+            f'Digest realm="realm", qop="auth", nonce="{state["nonce"]}", '
+            f'stale={state["stale"]}'
+        )
+        return httpx.Response(401, headers={"www-authenticate": challenge})
+
+    auth = httpx.DigestAuth(username="user", password="password123")
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        response = client.get("http://example.org/")
+        assert response.status_code == 200
+
+        # The server rotates its nonce and rejects the previous one as stale.
+        state["nonce"] = "nonce-2"
+        state["stale"] = "true"
+        response = client.get("http://example.org/")
+        assert response.status_code == 200
+
+    assert len(requests) == 4
+    fields = parse_digest_auth_header(typing.cast(str, requests[1][1]))
+    assert fields["nonce"] == "nonce-1"
+    assert fields["nc"] == "00000001"
+    fields = parse_digest_auth_header(typing.cast(str, requests[2][1]))
+    assert fields["nonce"] == "nonce-1"
+    assert fields["nc"] == "00000002"
+    # The retry after the stale response uses the new nonce, with the
+    # nonce count restarted.
+    fields = parse_digest_auth_header(typing.cast(str, requests[3][1]))
+    assert fields["nonce"] == "nonce-2"
+    assert fields["nc"] == "00000001"
+
+
+def test_digest_auth_concurrent_retries_do_not_repeat_nonce_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Concurrent authentication flows against the same challenge must not
+    reuse the same nonce count.
+    """
+    barrier = threading.Barrier(2)
+    nonce_counts: typing.List[str] = []
+    lock = threading.Lock()
+
+    def app(request: httpx.Request) -> httpx.Response:
+        if "Authorization" not in request.headers:
+            # Ensure both requests are challenged with the same nonce,
+            # before either retry is sent.
+            barrier.wait(timeout=10)
+            challenge = 'Digest realm="realm", qop="auth", nonce="shared-nonce"'
+            return httpx.Response(401, headers={"www-authenticate": challenge})
+        fields = parse_digest_auth_header(request.headers["Authorization"])
+        assert fields["nonce"] == "shared-nonce"
+        with lock:
+            nonce_counts.append(fields["nc"])
+        return httpx.Response(200)
+
+    def fixed_client_nonce(nonce_count: int, nonce: bytes) -> bytes:
+        return b"fixed-cnonce"
+
+    auth = httpx.DigestAuth(username="user", password="password123")
+    monkeypatch.setattr(auth, "_get_client_nonce", fixed_client_nonce)
+
+    responses: typing.List[httpx.Response] = []
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        threads = [
+            threading.Thread(
+                target=lambda: responses.append(client.get("http://example.org/"))
+            )
+            for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert sorted(nonce_counts) == ["00000001", "00000002"]
+
+
+def test_digest_auth_does_not_reapply_cached_challenge_across_redirect() -> None:
+    """
+    When a redirect strips the 'Authorization' header, the cached challenge
+    of the original origin must not be re-applied to the redirect target,
+    and the target's own challenge must not replace it.
+    """
+    challenges = {
+        "a.example.org": 'Digest realm="realm-a", qop="auth", nonce="nonce-a"',
+        "b.example.org": 'Digest realm="realm-b", qop="auth", nonce="nonce-b"',
+    }
+    requests: typing.List[typing.Tuple[httpx.Request, typing.Optional[str]]] = []
+
+    def app(request: httpx.Request) -> httpx.Response:
+        requests.append((request, request.headers.get("Authorization")))
+        if request.url.host == "a.example.org" and request.url.path == "/redirect":
+            return httpx.Response(302, headers={"Location": "http://b.example.org/"})
+        if "Authorization" not in request.headers:
+            challenge = challenges[request.url.host]
+            return httpx.Response(401, headers={"www-authenticate": challenge})
+        return httpx.Response(200)
+
+    auth = httpx.DigestAuth(username="user", password="password123")
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        response = client.get("http://a.example.org/")
+        assert response.status_code == 200
+
+        # The redirect strips the 'Authorization' header, and the challenge
+        # cached for 'a.example.org' is not re-applied to 'b.example.org'.
+        # The 401 from the other origin is returned as-is.
+        response = client.get("http://a.example.org/redirect", follow_redirects=True)
+        assert response.status_code == 401
+
+        # The challenge from 'b.example.org' was cached under its own
+        # protection space, and is used for requests to that origin.
+        response = client.get("http://b.example.org/")
+        assert response.status_code == 200
+
+        # The challenge cached for 'a.example.org' is still in place.
+        response = client.get("http://a.example.org/")
+        assert response.status_code == 200
+
+    a_requests = [
+        authorization
+        for request, authorization in requests
+        if request.url.host == "a.example.org"
+    ]
+    b_requests = [
+        authorization
+        for request, authorization in requests
+        if request.url.host == "b.example.org"
+    ]
+
+    assert len(a_requests) == 4
+    fields = parse_digest_auth_header(typing.cast(str, a_requests[3]))
+    assert fields["realm"] == "realm-a"
+    assert fields["nonce"] == "nonce-a"
+    assert fields["nc"] == "00000003"
+
+    # The redirected request reached 'b.example.org' unauthenticated...
+    assert len(b_requests) == 2
+    assert b_requests[0] is None
+    # ... and the follow-up request uses the challenge that B issued.
+    fields = parse_digest_auth_header(typing.cast(str, b_requests[1]))
+    assert fields["realm"] == "realm-b"
+    assert fields["nonce"] == "nonce-b"
+    assert fields["nc"] == "00000001"
+
+
+@pytest.mark.parametrize(
+    "bad_challenge",
+    [
+        # Missing the required 'nonce' field.
+        'Digest realm="realm", qop="auth"',
+        # An algorithm that we do not support.
+        'Digest realm="realm", qop="auth", nonce="nonce-2", algorithm=MD5-404',
+    ],
+)
+def test_digest_auth_invalid_challenge_does_not_clobber_cache(
+    bad_challenge: str,
+) -> None:
+    """
+    A malformed or unsupported challenge must not replace a usable
+    cached challenge.
+    """
+    state: typing.Dict[str, typing.Any] = {
+        "challenge": 'Digest realm="realm", qop="auth", nonce="nonce-1"',
+        "challenge_next": False,
+    }
+    requests: typing.List[typing.Tuple[httpx.Request, typing.Optional[str]]] = []
+
+    def app(request: httpx.Request) -> httpx.Response:
+        requests.append((request, request.headers.get("Authorization")))
+        if state["challenge_next"] or "Authorization" not in request.headers:
+            state["challenge_next"] = False
+            return httpx.Response(401, headers={"www-authenticate": state["challenge"]})
+        return httpx.Response(200)
+
+    auth = httpx.DigestAuth(username="user", password="password123")
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        response = client.get("http://example.org/")
+        assert response.status_code == 200
+
+        state["challenge"] = bad_challenge
+        state["challenge_next"] = True
+        with pytest.raises(httpx.ProtocolError):
+            client.get("http://example.org/")
+
+        # The previously cached challenge is still in place.
+        response = client.get("http://example.org/")
+        assert response.status_code == 200
+
+    fields = parse_digest_auth_header(typing.cast(str, requests[-1][1]))
+    assert fields["nonce"] == "nonce-1"
+    assert fields["nc"] == "00000003"
+
+
 @pytest.mark.anyio
 async def test_async_auth_history() -> None:
     """

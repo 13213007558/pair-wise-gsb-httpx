@@ -104,6 +104,67 @@ def test_digest_auth_with_401_nonce_counting():
         flow.send(response)
 
 
+def test_digest_auth_interleaved_flows_use_their_own_challenges():
+    auth = httpx.DigestAuth(username="user", password="pass")
+
+    # Two authentication flows on the same instance, interleaved.
+    flow_a = auth.sync_auth_flow(httpx.Request("GET", "https://a.example.com"))
+    request_a = next(flow_a)
+    assert "Authorization" not in request_a.headers
+
+    flow_b = auth.sync_auth_flow(httpx.Request("GET", "https://b.example.com"))
+    request_b = next(flow_b)
+    assert "Authorization" not in request_b.headers
+
+    # Each flow retries with the challenge that it received.
+    headers_a = {
+        "WWW-Authenticate": 'Digest realm="realm-a", qop="auth", nonce="nonce-a"'
+    }
+    response_a = httpx.Response(
+        content=b"Auth required", status_code=401, headers=headers_a, request=request_a
+    )
+    retry_a = flow_a.send(response_a)
+    scheme, _, fields = retry_a.headers["Authorization"].partition(" ")
+    assert scheme == "Digest"
+    fields_a = parse_keqv_list(fields.split(", "))
+    assert fields_a["realm"] == "realm-a"
+    assert fields_a["nonce"] == "nonce-a"
+    assert fields_a["nc"] == "00000001"
+
+    headers_b = {
+        "WWW-Authenticate": 'Digest realm="realm-b", qop="auth", nonce="nonce-b"'
+    }
+    response_b = httpx.Response(
+        content=b"Auth required", status_code=401, headers=headers_b, request=request_b
+    )
+    retry_b = flow_b.send(response_b)
+    scheme, _, fields = retry_b.headers["Authorization"].partition(" ")
+    assert scheme == "Digest"
+    fields_b = parse_keqv_list(fields.split(", "))
+    assert fields_b["realm"] == "realm-b"
+    assert fields_b["nonce"] == "nonce-b"
+    assert fields_b["nc"] == "00000001"
+
+    # Subsequent requests to each origin reuse their own cached challenge.
+    flow_a = auth.sync_auth_flow(httpx.Request("GET", "https://a.example.com"))
+    request_a = next(flow_a)
+    fields_a = parse_keqv_list(
+        request_a.headers["Authorization"].partition(" ")[2].split(", ")
+    )
+    assert fields_a["realm"] == "realm-a"
+    assert fields_a["nonce"] == "nonce-a"
+    assert fields_a["nc"] == "00000002"
+
+    flow_b = auth.sync_auth_flow(httpx.Request("GET", "https://b.example.com"))
+    request_b = next(flow_b)
+    fields_b = parse_keqv_list(
+        request_b.headers["Authorization"].partition(" ")[2].split(", ")
+    )
+    assert fields_b["realm"] == "realm-b"
+    assert fields_b["nonce"] == "nonce-b"
+    assert fields_b["nc"] == "00000002"
+
+
 def set_cookies(request: httpx.Request) -> httpx.Response:
     headers = {
         "Set-Cookie": "session=.session_value...",
