@@ -502,14 +502,223 @@ async def test_digest_auth_qop_including_spaces_and_auth_returns_auth(qop: str) 
 
 
 @pytest.mark.anyio
-async def test_digest_auth_qop_auth_int_not_implemented() -> None:
+async def test_digest_auth_qop_auth_int_default_client() -> None:
+    # A default client (qop="auth") transparently upgrades to "auth-int"
+    # when that is the only qop offered by the server.
     url = "https://example.org/"
     auth = httpx.DigestAuth(username="user", password="password123")
     app = DigestApp(qop="auth-int")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
-        with pytest.raises(NotImplementedError):
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+    authorization = response.json()["auth"]
+    assert "qop=auth-int" in authorization
+
+
+@pytest.mark.anyio
+async def test_digest_auth_qop_auth_int_explicit_picks_auth_int() -> None:
+    # When the server offers both qop values, an explicit auth-int client
+    # must select auth-int rather than being silently downgraded to auth.
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123", qop="auth-int")
+    app = DigestApp(qop="auth, auth-int")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert "qop=auth-int" in response.json()["auth"]
+
+
+@pytest.mark.anyio
+async def test_digest_auth_qop_auth_int_rejects_auth_only_server() -> None:
+    # An explicit integrity-protection request must never be downgraded to
+    # "auth" against a server that does not offer "auth-int".
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123", qop="auth-int")
+    app = DigestApp(qop="auth")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
             await client.get(url, auth=auth)
+
+
+@pytest.mark.anyio
+async def test_digest_auth_qop_auth_int_rejects_missing_qop() -> None:
+    # auth-int is only defined together with a qop, so a challenge without
+    # one cannot satisfy an explicit integrity-protection request.
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123", qop="auth-int")
+    app = DigestApp(qop="")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+
+def test_digest_auth_invalid_qop_value() -> None:
+    with pytest.raises(ValueError):
+        httpx.DigestAuth(username="user", password="password123", qop="bogus")
+
+
+class _RecordingTransport(httpx.MockTransport):
+    """
+    Consumes each request body without buffering it onto the request, so the
+    request stream retains its original (potentially one-shot) type.
+    """
+
+    def __init__(self, handler: typing.Callable[..., typing.Any]) -> None:
+        super().__init__(handler)
+        self.bodies: list[bytes] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.SyncByteStream)
+        self.bodies.append(b"".join(iter(request.stream)))
+        return self.handler(request)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.AsyncByteStream)
+        self.bodies.append(b"".join([chunk async for chunk in request.stream]))
+        return self.handler(request)
+
+
+def _auth_int_challenge(request: httpx.Request) -> httpx.Response:
+    if request.headers.get("Authorization"):
+        return httpx.Response(200, json={"auth": request.headers["Authorization"]})
+    return httpx.Response(
+        401,
+        headers={
+            "WWW-Authenticate": (
+                'Digest realm="http-auth@example.org", qop="auth, auth-int", '
+                'algorithm=MD5, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", '
+                'opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS"'
+            )
+        },
+    )
+
+
+def test_digest_auth_int_replays_one_shot_sync_body_identically() -> None:
+    entity = b"".join(bytes((i,)) for i in range(256))
+
+    def one_shot() -> typing.Iterator[bytes]:
+        yield entity[:100]
+        yield entity[100:]
+
+    transport = _RecordingTransport(_auth_int_challenge)
+    auth = httpx.DigestAuth("Mufasa", "Circle of Life", qop="auth-int")
+    auth._get_client_nonce = (
+        lambda nonce_count, nonce: b"f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ"
+    )
+
+    with httpx.Client(transport=transport) as client:
+        response = client.post(
+            "https://example.org/dir/index.html", content=one_shot(), auth=auth
+        )
+
+    assert response.status_code == 200
+    # The first request and the authenticated replay carry the exact same
+    # entity bytes, even though the source could only be traversed once.
+    assert transport.bodies == [entity, entity]
+    assert "qop=auth-int" in response.json()["auth"]
+
+
+@pytest.mark.anyio
+async def test_digest_auth_int_replays_one_shot_async_body_identically() -> None:
+    entity = b"".join(bytes((i,)) for i in range(256))
+
+    async def one_shot() -> typing.AsyncIterator[bytes]:
+        yield entity[:100]
+        yield entity[100:]
+
+    transport = _RecordingTransport(_auth_int_challenge)
+    auth = httpx.DigestAuth("Mufasa", "Circle of Life", qop="auth-int")
+    auth._get_client_nonce = (
+        lambda nonce_count, nonce: b"f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ"
+    )
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post(
+            "https://example.org/dir/index.html", content=one_shot(), auth=auth
+        )
+
+    assert response.status_code == 200
+    assert transport.bodies == [entity, entity]
+    assert "qop=auth-int" in response.json()["auth"]
+
+
+def test_digest_auth_int_spool_is_closed_after_flow() -> None:
+    auth = httpx.DigestAuth("Mufasa", "Circle of Life", qop="auth-int")
+    request = httpx.Request(
+        "POST", "https://example.org/dir/index.html", content=b"abc"
+    )
+
+    flow = auth.sync_auth_flow(request)
+    next(flow)
+    spool = request.stream
+    assert isinstance(spool, httpx._auth._SyncSpooledByteStream)
+
+    response = httpx.Response(200)
+    with pytest.raises(StopIteration):
+        flow.send(response)
+    flow.close()
+
+    assert spool._spool.closed is True
+
+
+def test_digest_auth_int_closes_spool_when_source_read_fails() -> None:
+    class FailingStream(httpx.SyncByteStream):
+        def __iter__(self) -> typing.Iterator[bytes]:
+            yield b"partial"
+            raise OSError("source failure")
+
+    auth = httpx.DigestAuth("Mufasa", "Circle of Life", qop="auth-int")
+    request = httpx.Request("POST", "https://example.org/", stream=FailingStream())
+
+    flow = auth.sync_auth_flow(request)
+    with pytest.raises(OSError):
+        next(flow)
+    # The request stream is left untouched and no spool is retained.
+    assert isinstance(request.stream, FailingStream)
+
+
+def test_digest_auth_int_spills_large_body_to_disk() -> None:
+    entity = b"z" * (httpx.DigestAuth._SPOOL_MAX_SIZE + 1024)
+
+    def one_shot() -> typing.Iterator[bytes]:
+        for index in range(0, len(entity), 100_000):
+            yield entity[index : index + 100_000]
+
+    transport = _RecordingTransport(_auth_int_challenge)
+    auth = httpx.DigestAuth("Mufasa", "Circle of Life", qop="auth-int")
+
+    with httpx.Client(transport=transport) as client:
+        response = client.post(
+            "https://example.org/dir/index.html", content=one_shot(), auth=auth
+        )
+
+    assert response.status_code == 200
+    assert transport.bodies == [entity, entity]
+    assert "qop=auth-int" in response.json()["auth"]
+
+
+@pytest.mark.anyio
+async def test_digest_auth_int_unavailable_streaming_body_without_spooling() -> None:
+    # A default (qop="auth") client does not pre-buffer the body. If the only
+    # challenge offered is auth-int and the body is a one-shot stream, the
+    # request must fail rather than be silently replayed with an empty body.
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="auth-int")
+
+    async def streaming_body() -> typing.AsyncIterator[bytes]:
+        yield b"Example request body"  # pragma: no cover
+
+    async with httpx.AsyncClient(transport=ConsumeBodyTransport(app)) as client:
+        with pytest.raises(httpx.StreamConsumed):
+            await client.post(url, content=streaming_body(), auth=auth)
 
 
 @pytest.mark.anyio

@@ -40,6 +40,32 @@ HTTP digest authentication is a challenge-response authentication scheme. Unlike
 [<Response [401 UNAUTHORIZED]>]
 ```
 
+### Integrity protection (`qop="auth-int"`)
+
+Digest authentication can also protect the integrity of the request entity body
+using the `auth-int` quality of protection, as defined by
+[RFC 7616](https://datatracker.ietf.org/doc/html/rfc7616). Pass `qop="auth-int"`
+to request it explicitly:
+
+```pycon
+>>> auth = httpx.DigestAuth(username="olivia", password="secret", qop="auth-int")
+```
+
+When the server offers both `auth` and `auth-int`, a default `DigestAuth`
+selects `auth`, while an instance constructed with `qop="auth-int"` selects
+`auth-int` and raises `httpx.ProtocolError` if the server cannot provide it —
+integrity protection is never silently downgraded. A default client still
+accepts a server that offers `auth-int` as its only quality of protection.
+
+Because the `auth-int` checksum is computed over the exact request entity
+bytes and the body must be replayed after the `401` challenge, an explicit
+`qop="auth-int"` instance buffers the request body before sending it. Small
+bodies are kept in memory and larger ones spill to a temporary file, so large
+uploads are not held entirely in RAM. One-shot byte iterators (sync and async)
+are therefore safe to use, whereas a default client cannot apply `auth-int` to
+a stream that has already been consumed and raises `httpx.StreamConsumed`
+rather than replaying an empty body.
+
 ## NetRC authentication
 
 HTTPX can be configured to use [a `.netrc` config file](https://everything.curl.dev/usingcurl/netrc) for authentication.
