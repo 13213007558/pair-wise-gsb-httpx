@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add explicit cookie partitions to `Client` and `AsyncClient`, via a `cookie_partition` request argument, plus `cookies_for()`, `clear_cookie_partition()` and `cookie_partitions` on the client, allowing multiple users to share one client and its connection pool with isolated cookie state.
 
 ## 0.28.1 (6th December, 2024)
 

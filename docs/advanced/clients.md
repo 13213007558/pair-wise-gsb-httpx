@@ -125,6 +125,37 @@ b'alice:ecila123'
 
 If you need finer-grained control on the merging of client-level and request-level parameters, see [Request instances](#request-instances).
 
+## Cookie partitions
+
+A single client can be shared between multiple users or sessions, keeping each user's cookies isolated from the others, while still sharing the underlying connection pool and transport resources. Use the `cookie_partition` argument to bind a request to a named cookie partition:
+
+```pycon
+>>> with httpx.Client(follow_redirects=True) as client:
+...     # Each request is bound to its own cookie partition...
+...     client.get('https://example.org/login?user=alice', cookie_partition='alice')
+...     client.get('https://example.org/login?user=bob', cookie_partition='bob')
+...
+...     # ...so `Set-Cookie` responses only ever land in the partition
+...     # that the request was bound to.
+...     client.cookies_for('alice').get('session')
+'alice'
+>>> client.cookies_for('bob').get('session')
+'bob'
+```
+
+The selected partition applies for the whole lifetime of a request, including any authentication retries, redirects, and the final response. Request-level `cookies=...` are merged over the partition cookies using the usual [merging rules](#merging-of-configuration), without being persisted back into the partition.
+
+Requests that don't pass `cookie_partition` use the default partition, which is what `client.cookies` operates on. The default partition never includes cookies from other partitions:
+
+```pycon
+>>> client.cookies  # The default partition only.
+<Cookies[]>
+>>> client.cookie_partitions  # A read-only view of all partitions.
+{None: <Cookies[]>, 'alice': <Cookies[<Cookie session=alice for example.org />]>, ...}
+```
+
+Use `client.clear_cookie_partition(partition)` to release a single user's cookie state, leaving other partitions and the shared transport untouched. Any of that user's requests that are still in-flight complete against a detached copy of their cookies, and will not recreate the partition.
+
 ## Other Client-only configuration options
 
 Additionally, `Client` accepts some configuration options that aren't available at the request level.

@@ -7,7 +7,7 @@ import time
 import typing
 import warnings
 from contextlib import asynccontextmanager, contextmanager
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 
 from .__version__ import __version__
 from ._auth import Auth, BasicAuth, FunctionAuth
@@ -57,6 +57,10 @@ __all__ = ["USE_CLIENT_DEFAULT", "AsyncClient", "Client"]
 # https://www.python.org/dev/peps/pep-0484/#annotating-instance-and-class-methods
 T = typing.TypeVar("T", bound="Client")
 U = typing.TypeVar("U", bound="AsyncClient")
+
+# The partition key used for the default cookie partition, which the
+# `client.cookies` property operates on.
+DEFAULT_COOKIE_PARTITION = None
 
 
 def _is_https_redirect(url: URL, location: URL) -> bool:
@@ -208,7 +212,9 @@ class BaseClient:
         self._auth = self._build_auth(auth)
         self._params = QueryParams(params)
         self.headers = Headers(headers)
-        self._cookies = Cookies(cookies)
+        self._cookie_partitions: dict[typing.Hashable, Cookies] = {
+            DEFAULT_COOKIE_PARTITION: Cookies(cookies)
+        }
         self._timeout = Timeout(timeout)
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
@@ -319,12 +325,55 @@ class BaseClient:
     def cookies(self) -> Cookies:
         """
         Cookie values to include when sending requests.
+
+        This operates on the default cookie partition only. Cookies belonging
+        to other partitions are never included here. See `cookies_for()` and
+        the `cookie_partition` argument on `request()` for working with
+        explicit cookie partitions.
         """
-        return self._cookies
+        return self._cookie_partitions[DEFAULT_COOKIE_PARTITION]
 
     @cookies.setter
     def cookies(self, cookies: CookieTypes) -> None:
-        self._cookies = Cookies(cookies)
+        self._cookie_partitions[DEFAULT_COOKIE_PARTITION] = Cookies(cookies)
+
+    @property
+    def cookie_partitions(self) -> typing.Mapping[typing.Hashable, Cookies]:
+        """
+        A read-only view of the cookie partitions currently held by the
+        client, mapping each partition key to its `Cookies` instance.
+
+        The default partition is keyed by `None`.
+        """
+        return MappingProxyType(self._cookie_partitions)
+
+    def cookies_for(self, partition: typing.Hashable | None = None) -> Cookies:
+        """
+        Return the `Cookies` instance for the given cookie partition,
+        creating an empty partition if one does not exist yet.
+
+        Calling this with `partition=None` is equivalent to accessing
+        `client.cookies`.
+        """
+        try:
+            return self._cookie_partitions[partition]
+        except KeyError:
+            cookies = self._cookie_partitions[partition] = Cookies()
+            return cookies
+
+    def clear_cookie_partition(self, partition: typing.Hashable | None = None) -> None:
+        """
+        Drop all cookie state associated with the given partition, without
+        affecting any other partitions or the underlying transport.
+
+        Any requests that are already in-flight for the partition complete
+        against a detached copy of its cookies, and will not recreate the
+        partition or repopulate it with `Set-Cookie` state.
+        """
+        if partition is DEFAULT_COOKIE_PARTITION:
+            self._cookie_partitions[DEFAULT_COOKIE_PARTITION] = Cookies()
+        else:
+            self._cookie_partitions.pop(partition, None)
 
     @property
     def params(self) -> QueryParams:
@@ -349,6 +398,7 @@ class BaseClient:
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Request:
@@ -358,6 +408,9 @@ class BaseClient:
         * The `params`, `headers` and `cookies` arguments
         are merged with any values set on the client.
         * The `url` argument is merged with any `base_url` set on the client.
+        * The `cookie_partition` argument selects which cookie partition
+        the request is bound to. The partition persists across
+        authentication, redirects, and response `Set-Cookie` handling.
 
         See also: [Request instances][0]
 
@@ -365,9 +418,16 @@ class BaseClient:
         """
         url = self._merge_url(url)
         headers = self._merge_headers(headers)
-        cookies = self._merge_cookies(cookies)
+        cookies = self._merge_cookies(cookies, partition=cookie_partition)
         params = self._merge_queryparams(params)
         extensions = {} if extensions is None else extensions
+        if cookie_partition is not None:
+            # Bind the request to the cookie jar for the partition, so that
+            # the partition is retained throughout authentication, redirects,
+            # and response `Set-Cookie` handling.
+            extensions = dict(
+                **extensions, cookie_partition=self.cookies_for(cookie_partition)
+            )
         if "timeout" not in extensions:
             timeout = (
                 self.timeout
@@ -410,16 +470,33 @@ class BaseClient:
             return self.base_url.copy_with(raw_path=merge_raw_path)
         return merge_url
 
-    def _merge_cookies(self, cookies: CookieTypes | None = None) -> CookieTypes | None:
+    def _merge_cookies(
+        self,
+        cookies: CookieTypes | None = None,
+        partition: typing.Hashable | None = None,
+    ) -> CookieTypes | None:
         """
         Merge a cookies argument together with any cookies on the client,
         to create the cookies used for the outgoing request.
         """
-        if cookies or self.cookies:
-            merged_cookies = Cookies(self.cookies)
+        client_cookies = (
+            self.cookies if partition is None else self.cookies_for(partition)
+        )
+        if cookies or client_cookies:
+            merged_cookies = Cookies(client_cookies)
             merged_cookies.update(cookies)
             return merged_cookies
         return cookies
+
+    def _request_cookies(self, request: Request) -> Cookies:
+        """
+        Return the cookie jar that a request is bound to, taking any
+        cookie partition into account.
+        """
+        partition_cookies = request.extensions.get("cookie_partition")
+        if partition_cookies is None:
+            return self.cookies
+        return typing.cast(Cookies, partition_cookies)
 
     def _merge_headers(self, headers: HeaderTypes | None = None) -> HeaderTypes | None:
         """
@@ -481,7 +558,7 @@ class BaseClient:
         url = self._redirect_url(request, response)
         headers = self._redirect_headers(request, url, method)
         stream = self._redirect_stream(request, method)
-        cookies = Cookies(self.cookies)
+        cookies = Cookies(self._request_cookies(request))
         return Request(
             method=method,
             url=url,
@@ -780,6 +857,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -801,7 +879,7 @@ class Client(BaseClient):
 
         [0]: /advanced/clients/#merging-of-configuration
         """
-        if cookies is not None:
+        if cookies is not None and cookie_partition is None:
             message = (
                 "Setting per-request cookies=<...> is being deprecated, because "
                 "the expected behaviour on cookie persistence is ambiguous. Set "
@@ -819,6 +897,7 @@ class Client(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             timeout=timeout,
             extensions=extensions,
         )
@@ -837,6 +916,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -862,6 +942,7 @@ class Client(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             timeout=timeout,
             extensions=extensions,
         )
@@ -1019,7 +1100,7 @@ class Client(BaseClient):
         response.stream = BoundSyncStream(
             response.stream, response=response, start=start
         )
-        self.cookies.extract_cookies(response)
+        self._request_cookies(request).extract_cookies(response)
         response.default_encoding = self._default_encoding
 
         logger.info(
@@ -1040,6 +1121,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1056,6 +1138,7 @@ class Client(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1069,6 +1152,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1085,6 +1169,7 @@ class Client(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1098,6 +1183,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1114,6 +1200,7 @@ class Client(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1131,6 +1218,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1151,6 +1239,7 @@ class Client(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1168,6 +1257,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1188,6 +1278,7 @@ class Client(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1205,6 +1296,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1225,6 +1317,7 @@ class Client(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1238,6 +1331,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1254,6 +1348,7 @@ class Client(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1494,6 +1589,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1516,7 +1612,7 @@ class AsyncClient(BaseClient):
         [0]: /advanced/clients/#merging-of-configuration
         """
 
-        if cookies is not None:  # pragma: no cover
+        if cookies is not None and cookie_partition is None:
             message = (
                 "Setting per-request cookies=<...> is being deprecated, because "
                 "the expected behaviour on cookie persistence is ambiguous. Set "
@@ -1534,6 +1630,7 @@ class AsyncClient(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             timeout=timeout,
             extensions=extensions,
         )
@@ -1552,6 +1649,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1577,6 +1675,7 @@ class AsyncClient(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             timeout=timeout,
             extensions=extensions,
         )
@@ -1734,7 +1833,7 @@ class AsyncClient(BaseClient):
         response.stream = BoundAsyncStream(
             response.stream, response=response, start=start
         )
-        self.cookies.extract_cookies(response)
+        self._request_cookies(request).extract_cookies(response)
         response.default_encoding = self._default_encoding
 
         logger.info(
@@ -1755,6 +1854,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1771,6 +1871,7 @@ class AsyncClient(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1784,6 +1885,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1800,6 +1902,7 @@ class AsyncClient(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1813,6 +1916,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1829,6 +1933,7 @@ class AsyncClient(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1846,6 +1951,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1866,6 +1972,7 @@ class AsyncClient(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1883,6 +1990,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1903,6 +2011,7 @@ class AsyncClient(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1920,6 +2029,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1940,6 +2050,7 @@ class AsyncClient(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
@@ -1953,6 +2064,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: typing.Hashable | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1969,6 +2081,7 @@ class AsyncClient(BaseClient):
             params=params,
             headers=headers,
             cookies=cookies,
+            cookie_partition=cookie_partition,
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
