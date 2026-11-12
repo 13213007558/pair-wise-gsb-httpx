@@ -13,6 +13,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add `sensitive_query_params` to `Client` and `AsyncClient`, to configure which URL query parameters have their values masked in diagnostic output.
+
+### Changed
+
+* The `httpx` request log, `Request`/`URL`/`Proxy` representations, and human-facing exception messages now render a safe view of URLs: userinfo credentials are always masked (including the username), and the values of sensitive query parameters are masked by default. The actual `Request`, `Response.request`, and the URL sent to the transport are unchanged; use `str(url)` for the unmasked value.
 
 ## 0.28.1 (6th December, 2024)
 

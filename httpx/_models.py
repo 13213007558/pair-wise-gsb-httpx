@@ -494,8 +494,18 @@ class Request:
         return self._content
 
     def __repr__(self) -> str:
+        from ._diagnostics import (
+            DEFAULT_SENSITIVE_QUERY_PARAMS,
+            redact_url,
+        )
+
         class_name = self.__class__.__name__
-        url = str(self.url)
+        sensitive_params = getattr(
+            self,
+            "_sensitive_query_params",
+            DEFAULT_SENSITIVE_QUERY_PARAMS,
+        )
+        url = redact_url(self.url, sensitive_params=sensitive_params)
         return f"<{class_name}({self.method!r}, {url!r})>"
 
     def __getstate__(self) -> dict[str, typing.Any]:
@@ -805,17 +815,33 @@ class Response:
         if self.is_success:
             return self
 
+        from ._diagnostics import (
+            DEFAULT_SENSITIVE_QUERY_PARAMS,
+            redact_url,
+        )
+
+        sensitive_params = getattr(
+            request,
+            "_sensitive_query_params",
+            DEFAULT_SENSITIVE_QUERY_PARAMS,
+        )
+        safe_url = redact_url(request.url, sensitive_params=sensitive_params)
+
         if self.has_redirect_location:
             message = (
-                "{error_type} '{0.status_code} {0.reason_phrase}' for url '{0.url}'\n"
-                "Redirect location: '{0.headers[location]}'\n"
-                "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/{0.status_code}"
+                "{error_type} '{0.status_code} {0.reason_phrase}' for url '{1}'\n"
+                "Redirect location: '{2}'\n"
+                "For more information check: https://developer.mozilla.org/en-US/docs/HTTP/Status/{0.status_code}"
+            )
+            safe_location = redact_url(
+                self.headers["location"], sensitive_params=sensitive_params
             )
         else:
             message = (
-                "{error_type} '{0.status_code} {0.reason_phrase}' for url '{0.url}'\n"
-                "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/{0.status_code}"
+                "{error_type} '{0.status_code} {0.reason_phrase}' for url '{1}'\n"
+                "For more information check: https://developer.mozilla.org/en-US/docs/HTTP/Status/{0.status_code}"
             )
+            safe_location = None
 
         status_class = self.status_code // 100
         error_types = {
@@ -825,7 +851,7 @@ class Response:
             5: "Server error",
         }
         error_type = error_types.get(status_class, "Invalid status code")
-        message = message.format(self, error_type=error_type)
+        message = message.format(self, safe_url, safe_location, error_type=error_type)
         raise HTTPStatusError(message, request=request, response=self)
 
     def json(self, **kwargs: typing.Any) -> typing.Any:

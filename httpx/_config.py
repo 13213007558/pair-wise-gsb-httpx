@@ -233,11 +233,16 @@ class Proxy:
         )
 
     def __repr__(self) -> str:
+        # The URL is rendered with any userinfo credentials or sensitive query
+        # parameters masked. The actual proxy URL used for connections is
+        # unaffected; see `str(self.url)`.
+        from ._diagnostics import redact_url
+
         # The authentication is represented with the password component masked.
         auth = (self.auth[0], "********") if self.auth else None
 
         # Build a nice concise representation.
-        url_str = f"{str(self.url)!r}"
+        url_str = f"{redact_url(self.url)!r}"
         auth_str = f", auth={auth!r}" if auth else ""
         headers_str = f", headers={dict(self.headers)!r}" if self.headers else ""
         return f"Proxy({url_str}{auth_str}{headers_str})"

@@ -20,6 +20,7 @@ from ._config import (
     Timeout,
 )
 from ._decoders import SUPPORTED_DECODERS
+from ._diagnostics import DEFAULT_SENSITIVE_QUERY_PARAMS, redact_url
 from ._exceptions import (
     InvalidURL,
     RemoteProtocolError,
@@ -200,6 +201,7 @@ class BaseClient:
         base_url: URL | str = "",
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        sensitive_query_params: typing.Container[str] | None = None,
     ) -> None:
         event_hooks = {} if event_hooks is None else event_hooks
 
@@ -218,7 +220,20 @@ class BaseClient:
         }
         self._trust_env = trust_env
         self._default_encoding = default_encoding
+        self._sensitive_query_params = self._build_sensitive_query_params(
+            sensitive_query_params
+        )
         self._state = ClientState.UNOPENED
+
+    @staticmethod
+    def _build_sensitive_query_params(
+        sensitive_query_params: typing.Container[str] | None,
+    ) -> typing.Container[str]:
+        if sensitive_query_params is None:
+            from ._diagnostics import DEFAULT_SENSITIVE_QUERY_PARAMS
+
+            return DEFAULT_SENSITIVE_QUERY_PARAMS
+        return frozenset(name.lower() for name in sensitive_query_params)
 
     @property
     def is_closed(self) -> bool:
@@ -230,6 +245,17 @@ class BaseClient:
     @property
     def trust_env(self) -> bool:
         return self._trust_env
+
+    @property
+    def sensitive_query_params(self) -> typing.Container[str]:
+        """
+        Query parameter names whose values are masked in diagnostic output
+        (the `httpx` request log and human-facing exception messages), matched
+        case-insensitively and independently of percent-encoding.
+
+        The actual request URL sent to the transport is never modified.
+        """
+        return self._sensitive_query_params
 
     def _enforce_trailing_slash(self, url: URL) -> URL:
         if url.raw_path.endswith(b"/"):
@@ -375,7 +401,7 @@ class BaseClient:
                 else Timeout(timeout)
             )
             extensions = dict(**extensions, timeout=timeout.as_dict())
-        return Request(
+        request = Request(
             method,
             url,
             content=content,
@@ -387,6 +413,10 @@ class BaseClient:
             cookies=cookies,
             extensions=extensions,
         )
+        # Display-only configuration used when rendering this request in logs
+        # and exception messages. Never consulted by the transport.
+        request._sensitive_query_params = self._sensitive_query_params
+        return request
 
     def _merge_url(self, url: URL | str) -> URL:
         """
@@ -482,7 +512,7 @@ class BaseClient:
         headers = self._redirect_headers(request, url, method)
         stream = self._redirect_stream(request, method)
         cookies = Cookies(self.cookies)
-        return Request(
+        redirect_request = Request(
             method=method,
             url=url,
             headers=headers,
@@ -490,6 +520,10 @@ class BaseClient:
             stream=stream,
             extensions=request.extensions,
         )
+        redirect_request._sensitive_query_params = getattr(
+            request, "_sensitive_query_params", self._sensitive_query_params
+        )
+        return redirect_request
 
     def _redirect_method(self, request: Request, response: Response) -> str:
         """
@@ -634,6 +668,12 @@ class Client(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **sensitive_query_params** - *(optional)* A collection of query parameter
+    names whose values are masked in `httpx`'s request log and human-facing
+    exception messages (matched case-insensitively, ignoring percent-encoding).
+    Defaults to a built-in set of common credential-bearing names. Pass an empty
+    collection to disable query masking. The URL actually sent to the transport is
+    not affected.
     """
 
     def __init__(
@@ -658,6 +698,7 @@ class Client(BaseClient):
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        sensitive_query_params: typing.Container[str] | None = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -671,6 +712,7 @@ class Client(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            sensitive_query_params=sensitive_query_params,
         )
 
         if http2:
@@ -1025,7 +1067,14 @@ class Client(BaseClient):
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',
             request.method,
-            request.url,
+            redact_url(
+                request.url,
+                sensitive_params=getattr(
+                    request,
+                    "_sensitive_query_params",
+                    DEFAULT_SENSITIVE_QUERY_PARAMS,
+                ),
+            ),
             response.http_version,
             response.status_code,
             response.reason_phrase,
@@ -1348,6 +1397,12 @@ class AsyncClient(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **sensitive_query_params** - *(optional)* A collection of query parameter
+    names whose values are masked in `httpx`'s request log and human-facing
+    exception messages (matched case-insensitively, ignoring percent-encoding).
+    Defaults to a built-in set of common credential-bearing names. Pass an empty
+    collection to disable query masking. The URL actually sent to the transport is
+    not affected.
     """
 
     def __init__(
@@ -1372,6 +1427,7 @@ class AsyncClient(BaseClient):
         transport: AsyncBaseTransport | None = None,
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        sensitive_query_params: typing.Container[str] | None = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -1385,6 +1441,7 @@ class AsyncClient(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            sensitive_query_params=sensitive_query_params,
         )
 
         if http2:
@@ -1740,7 +1797,14 @@ class AsyncClient(BaseClient):
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',
             request.method,
-            request.url,
+            redact_url(
+                request.url,
+                sensitive_params=getattr(
+                    request,
+                    "_sensitive_query_params",
+                    DEFAULT_SENSITIVE_QUERY_PARAMS,
+                ),
+            ),
             response.http_version,
             response.status_code,
             response.reason_phrase,

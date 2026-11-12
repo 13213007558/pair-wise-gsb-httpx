@@ -79,3 +79,23 @@ httpx.get('https://www.example.com')
 ```
 
 The exact formatting of the debug logging may be subject to change across different versions of `httpx` and `httpcore`. If you need to rely on a particular format it is recommended that you pin installation of these packages to fixed versions.
+
+## Redacting sensitive URL data
+
+Request URLs sometimes carry credentials, such as a one-time token in the query string (`https://example.com/callback?token=...`) or a username and password in the userinfo (`https://user:password@example.com`). Because the `httpx` request log is typically forwarded into long-term log storage, `httpx` only ever writes a *safe view* of a URL to its own logs and to human-facing exception text:
+
+* Any userinfo component is masked in full, including the username, as `[secure]`.
+* The values of sensitive query parameters are masked as `[secure]`. By default the set includes common credential-bearing names such as `token`, `code`, `password`, `secret`, `api_key`, and `signature`. Matching is case-insensitive, ignores percent-encoding, and applies to every occurrence of a repeated key as well as empty values. Redirected URLs follow the same policy.
+
+Which parameter names are treated as sensitive is configurable per client:
+
+```python
+httpx.Client(sensitive_query_params={"token", "widget"})
+```
+
+Pass an empty collection (`frozenset()`) to disable query-parameter masking. The setting only affects diagnostic output. The actual `Request`, `Response.request`, and the URL handed to the transport are never rewritten, so request hooks and the network layer continue to receive the original values.
+
+The same safe view is used by `repr(request)`, `repr(url)`, `Proxy.__repr__`, and the messages of `HTTPStatusError` and other request exceptions. Use `str(url)` when you need the unmasked URL.
+
+Note that `httpx` only controls its own output. The network-level `httpcore` logger (and any other underlying transport library) emits its own records and is configured separately; adjust those loggers independently if they can contain sensitive data.
+

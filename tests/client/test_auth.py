@@ -301,10 +301,17 @@ async def test_auth_disable_per_request() -> None:
 
 
 def test_auth_hidden_url() -> None:
+    # Both the username and the password are credentials, so the entire
+    # userinfo component is masked in the diagnostic representation.
     url = "http://example-username:example-password@example.org/"
-    expected = "URL('http://example-username:[secure]@example.org/')"
+    expected = "URL('http://[secure]@example.org/')"
     assert url == httpx.URL(url)
     assert expected == repr(httpx.URL(url))
+
+    # A username-only userinfo is masked too, while `str()` stays unmasked.
+    user_only_url = "http://example-username@example.org/"
+    assert repr(httpx.URL(user_only_url)) == expected
+    assert str(httpx.URL(user_only_url)) == user_only_url
 
 
 @pytest.mark.anyio

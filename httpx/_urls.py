@@ -375,29 +375,12 @@ class URL:
         return str(self._uri_reference)
 
     def __repr__(self) -> str:
-        scheme, userinfo, host, port, path, query, fragment = self._uri_reference
+        # Render a safe, display-only view. Credentials in the userinfo (and,
+        # by default, sensitive query parameters) are masked. Use `str(url)`
+        # to obtain the unmasked URL.
+        from ._diagnostics import redact_url
 
-        if ":" in userinfo:
-            # Mask any password component.
-            userinfo = f"{userinfo.split(':')[0]}:[secure]"
-
-        authority = "".join(
-            [
-                f"{userinfo}@" if userinfo else "",
-                f"[{host}]" if ":" in host else host,
-                f":{port}" if port is not None else "",
-            ]
-        )
-        url = "".join(
-            [
-                f"{self.scheme}:" if scheme else "",
-                f"//{authority}" if authority else "",
-                path,
-                f"?{query}" if query is not None else "",
-                f"#{fragment}" if fragment is not None else "",
-            ]
-        )
-
+        url = redact_url(self)
         return f"{self.__class__.__name__}({url!r})"
 
     @property
